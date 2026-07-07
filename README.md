@@ -13,6 +13,14 @@ No bidirectional conflict handling, by design.
 
 ## Install
 
+One-liner (no clone needed):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/oguzkaganozt/gdrive-autosync/master/install.sh | bash
+```
+
+Or from a clone:
+
 ```bash
 git clone https://github.com/oguzkaganozt/gdrive-autosync
 cd gdrive-autosync && ./install.sh

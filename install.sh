@@ -1,10 +1,28 @@
 #!/bin/bash
 # gdrive-autosync installer: deps -> files -> config -> systemd user service.
+# Works both from a cloned repo and standalone via:
+#   curl -fsSL https://raw.githubusercontent.com/oguzkaganozt/gdrive-autosync/master/install.sh | bash
 set -euo pipefail
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RAW="https://raw.githubusercontent.com/oguzkaganozt/gdrive-autosync/master"
 CONF_DIR="$HOME/.config/gdrive-autosync"
 CONF="$CONF_DIR/folders.conf"
+
+# Detect local-repo mode (script sitting next to bin/ and systemd/)
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
+LOCAL_MODE=0
+[[ -n "$DIR" && -f "$DIR/bin/gdrive-autosync" ]] && LOCAL_MODE=1
+
+fetch() { # fetch <repo-relative-path> <dest> <mode>
+  if [[ "$LOCAL_MODE" -eq 1 ]]; then
+    install -Dm"$3" "$DIR/$1" "$2"
+  else
+    local tmp; tmp="$(mktemp)"
+    curl -fsSL "$RAW/$1" -o "$tmp"
+    install -Dm"$3" "$tmp" "$2"
+    rm -f "$tmp"
+  fi
+}
 
 echo "==> Checking dependencies"
 if ! command -v rclone >/dev/null; then
@@ -23,10 +41,9 @@ if ! rclone listremotes | grep -q '^gdrive:$'; then
   rclone config create gdrive drive scope=drive.file
 fi
 
-echo "==> Installing files"
-install -Dm755 "$DIR/bin/gdrive-autosync" "$HOME/.local/bin/gdrive-autosync"
-install -Dm644 "$DIR/systemd/gdrive-autosync.service" \
-  "$HOME/.config/systemd/user/gdrive-autosync.service"
+echo "==> Installing files ($([[ $LOCAL_MODE -eq 1 ]] && echo 'from local repo' || echo 'from GitHub'))"
+fetch "bin/gdrive-autosync" "$HOME/.local/bin/gdrive-autosync" 755
+fetch "systemd/gdrive-autosync.service" "$HOME/.config/systemd/user/gdrive-autosync.service" 644
 
 if [[ ! -f "$CONF" ]]; then
   echo "==> Creating default config: $CONF"
@@ -52,4 +69,4 @@ echo
 echo "Done. Useful commands:"
 echo "  systemctl --user status gdrive-autosync     # service state"
 echo "  journalctl --user -u gdrive-autosync -f     # live log"
-echo "  $EDITOR $CONF                                # edit watched folders"
+echo "  \${EDITOR:-nano} $CONF                        # edit watched folders"
