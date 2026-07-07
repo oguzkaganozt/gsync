@@ -1,0 +1,64 @@
+#!/bin/bash
+# gdrive-autosync: watch configured folders with inotify and mirror them
+# one-way (local -> Google Drive) via rclone whenever something changes.
+# Falls back to a full pass every hour in case events are missed.
+set -u
+
+CONF="$HOME/.config/gdrive-autosync/folders.conf"
+REMOTE="${GDRIVE_REMOTE:-gdrive}"
+QUIET="${GDRIVE_QUIET_SECONDS:-15}"
+
+EXCLUDES=(
+  --exclude 'node_modules/**'
+  --exclude '.cache/**'
+  --exclude '__pycache__/**'
+  --exclude '.venv/**'
+  --exclude 'target/**'
+  --exclude 'build/**'
+  --exclude '*.tmp'
+  --exclude '*.swp'
+)
+
+declare -a LOCALS REMOTES
+
+load_conf() {
+  LOCALS=(); REMOTES=()
+  while IFS='|' read -r l r; do
+    [[ -z "${l// /}" || "$l" == \#* ]] && continue
+    l="${l/#\~/$HOME}"
+    if [[ ! -d "$l" ]]; then
+      echo "SKIPPED (no such directory): $l"
+      continue
+    fi
+    LOCALS+=("$l"); REMOTES+=("$r")
+  done < "$CONF"
+}
+
+sync_all() {
+  local i
+  for i in "${!LOCALS[@]}"; do
+    echo "sync: ${LOCALS[$i]} -> ${REMOTE}:${REMOTES[$i]}"
+    rclone sync "${LOCALS[$i]}" "${REMOTE}:${REMOTES[$i]}" "${EXCLUDES[@]}" \
+      || echo "ERROR: sync failed: ${LOCALS[$i]}"
+  done
+}
+
+load_conf
+if [[ ${#LOCALS[@]} -eq 0 ]]; then
+  echo "Config empty or no valid directories: $CONF"
+  exit 1
+fi
+
+echo "Initial full sync (${#LOCALS[@]} folder(s))..."
+sync_all
+echo "Watching: ${LOCALS[*]}"
+
+while :; do
+  # Block until an event arrives; time out after 1h for a safety pass
+  inotifywait -r -q -t 3600 \
+    -e create -e modify -e delete -e move -e attrib \
+    "${LOCALS[@]}" >/dev/null 2>&1
+  sleep "$QUIET"
+  load_conf
+  sync_all
+done
