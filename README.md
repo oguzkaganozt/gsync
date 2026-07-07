@@ -1,15 +1,21 @@
 # gdrive-autosync
 
-Event-driven, one-way folder backup to Google Drive for Linux.
+Event-driven folder sync to Google Drive for Linux, with a small CLI.
 
-Watches the folders you list in a config file with **inotify**; whenever
-something changes, it mirrors that folder to Google Drive with **rclone**
-(after a 15s quiet window, so rapid saves become one sync). A full safety
-pass runs hourly even without events. Runs as a systemd **user** service —
-starts on login, restarts on failure, logs to the journal.
+Watches your folders with **inotify**; whenever something changes, it syncs
+that folder to Google Drive with **rclone** (after a 15s quiet window, so
+rapid saves become one sync). A safety pass runs periodically even without
+events. Runs as a systemd **user** service — starts on login, restarts on
+failure, logs to the journal.
 
-One-way means: local disk is the source of truth, Drive is the backup.
-No bidirectional conflict handling, by design.
+Two modes, per folder:
+
+- **oneway** (default) — mirrors local → Drive. Backup semantics: your disk
+  is the source of truth, Drive is the copy. No conflicts, ever.
+- **twoway** — `rclone bisync`; changes made on the Drive side flow back too
+  (picked up by the periodic pass, every ~5 min when any twoway folder is
+  configured). If both sides changed the same file between passes, rclone
+  keeps both versions as conflict copies instead of overwriting.
 
 ## Install
 
@@ -35,17 +41,21 @@ The installer:
 3. Installs the watcher to `~/.local/bin`, the unit to
    `~/.config/systemd/user`, and enables the service.
 
-## Configure
+## Use
 
-Edit `~/.config/gdrive-autosync/folders.conf`:
-
+```bash
+gdrive-autosync add ~/Documents                    # watch (oneway, -> pc-backup/Documents)
+gdrive-autosync add ~/notes shared/notes --two-way # custom Drive path, bidirectional
+gdrive-autosync list                               # what's being watched
+gdrive-autosync remove ~/Documents                 # stop watching (Drive files kept)
+gdrive-autosync sync                               # force a pass right now
+gdrive-autosync status                             # service state + folder list
+gdrive-autosync log                                # follow live log
 ```
-# LOCAL_FOLDER|DRIVE_TARGET_FOLDER
-~/Documents|pc-backup/documents
-~/projects/notes|pc-backup/notes
-```
 
-Then `systemctl --user restart gdrive-autosync`.
+`add`/`remove` edit `~/.config/gdrive-autosync/folders.conf`
+(format: `LOCAL|DRIVE_PATH|MODE`) and restart the service for you —
+editing the file by hand works too.
 
 Default excludes: `node_modules`, `.cache`, `__pycache__`, `.venv`,
 `target`, `build`, `*.tmp`, `*.swp`.

@@ -64,6 +64,7 @@ fi
 echo "==> Enabling service"
 systemctl --user daemon-reload
 systemctl --user enable --now gdrive-autosync
+systemctl --user try-restart gdrive-autosync 2>/dev/null || true
 
 echo
 echo "Done. Useful commands:"

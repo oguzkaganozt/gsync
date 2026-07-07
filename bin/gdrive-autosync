@@ -1,10 +1,21 @@
 #!/bin/bash
-# gdrive-autosync: watch configured folders with inotify and mirror them
-# one-way (local -> Google Drive) via rclone whenever something changes.
-# Falls back to a full pass every hour in case events are missed.
+# gdrive-autosync — event-driven folder sync to Google Drive (rclone + inotify).
+#
+#   gdrive-autosync add <dir> [drive_path] [--two-way]   watch a folder
+#   gdrive-autosync remove <dir>                         stop watching a folder
+#   gdrive-autosync list                                 show watched folders
+#   gdrive-autosync sync                                 force a sync pass now
+#   gdrive-autosync status                               service state
+#   gdrive-autosync log                                  follow live log
+#   gdrive-autosync daemon                               run watcher (systemd uses this)
+#
+# Modes: oneway (default) mirrors local -> Drive (backup semantics).
+#        twoway uses rclone bisync; remote changes flow back too.
 set -u
 
-CONF="$HOME/.config/gdrive-autosync/folders.conf"
+CONF_DIR="$HOME/.config/gdrive-autosync"
+CONF="$CONF_DIR/folders.conf"
+STATE_DIR="$HOME/.local/state/gdrive-autosync"
 REMOTE="${GDRIVE_REMOTE:-gdrive}"
 QUIET="${GDRIVE_QUIET_SECONDS:-15}"
 
@@ -19,46 +30,160 @@ EXCLUDES=(
   --exclude '*.swp'
 )
 
-declare -a LOCALS REMOTES
+declare -a LOCALS REMOTES MODES
 
 load_conf() {
-  LOCALS=(); REMOTES=()
-  while IFS='|' read -r l r; do
+  LOCALS=(); REMOTES=(); MODES=()
+  [[ -f "$CONF" ]] || return 0
+  while IFS='|' read -r l r m; do
     [[ -z "${l// /}" || "$l" == \#* ]] && continue
     l="${l/#\~/$HOME}"
     if [[ ! -d "$l" ]]; then
       echo "SKIPPED (no such directory): $l"
       continue
     fi
-    LOCALS+=("$l"); REMOTES+=("$r")
+    LOCALS+=("$l"); REMOTES+=("$r"); MODES+=("${m:-oneway}")
   done < "$CONF"
+}
+
+sync_one() {
+  local l="$1" r="$2" m="$3"
+  if [[ "$m" == "twoway" ]]; then
+    mkdir -p "$STATE_DIR"
+    local marker
+    marker="$STATE_DIR/$(printf '%s' "$l" | md5sum | awk '{print $1}').resynced"
+    if [[ ! -f "$marker" ]]; then
+      echo "bisync (first run, --resync): $l <-> ${REMOTE}:$r"
+      rclone bisync "$l" "${REMOTE}:$r" --resync "${EXCLUDES[@]}" && touch "$marker" \
+        || echo "ERROR: initial bisync failed: $l"
+    else
+      echo "bisync: $l <-> ${REMOTE}:$r"
+      rclone bisync "$l" "${REMOTE}:$r" "${EXCLUDES[@]}" \
+        || echo "ERROR: bisync failed: $l  (to force recovery: rm $marker)"
+    fi
+  else
+    echo "sync: $l -> ${REMOTE}:$r"
+    rclone sync "$l" "${REMOTE}:$r" "${EXCLUDES[@]}" \
+      || echo "ERROR: sync failed: $l"
+  fi
 }
 
 sync_all() {
   local i
   for i in "${!LOCALS[@]}"; do
-    echo "sync: ${LOCALS[$i]} -> ${REMOTE}:${REMOTES[$i]}"
-    rclone sync "${LOCALS[$i]}" "${REMOTE}:${REMOTES[$i]}" "${EXCLUDES[@]}" \
-      || echo "ERROR: sync failed: ${LOCALS[$i]}"
+    sync_one "${LOCALS[$i]}" "${REMOTES[$i]}" "${MODES[$i]}"
   done
 }
 
-load_conf
-if [[ ${#LOCALS[@]} -eq 0 ]]; then
-  echo "Config empty or no valid directories: $CONF"
-  exit 1
-fi
+poll_interval() {
+  # twoway folders need polling to pick up remote-side changes
+  local i
+  for i in "${!MODES[@]}"; do
+    [[ "${MODES[$i]}" == "twoway" ]] && { echo 300; return; }
+  done
+  echo 3600
+}
 
-echo "Initial full sync (${#LOCALS[@]} folder(s))..."
-sync_all
-echo "Watching: ${LOCALS[*]}"
+restart_service() {
+  if systemctl --user is-active -q gdrive-autosync 2>/dev/null; then
+    systemctl --user restart gdrive-autosync && echo "Service restarted."
+  fi
+}
 
-while :; do
-  # Block until an event arrives; time out after 1h for a safety pass
-  inotifywait -r -q -t 3600 \
-    -e create -e modify -e delete -e move -e attrib \
-    "${LOCALS[@]}" >/dev/null 2>&1
-  sleep "$QUIET"
+cmd_daemon() {
   load_conf
+  if [[ ${#LOCALS[@]} -eq 0 ]]; then
+    echo "No folders configured. Add one with: gdrive-autosync add <dir>"
+    exit 1
+  fi
+  echo "Initial sync (${#LOCALS[@]} folder(s))..."
   sync_all
-done
+  echo "Watching: ${LOCALS[*]}"
+  while :; do
+    inotifywait -r -q -t "$(poll_interval)" \
+      -e create -e modify -e delete -e move -e attrib \
+      "${LOCALS[@]}" >/dev/null 2>&1
+    sleep "$QUIET"
+    load_conf
+    sync_all
+  done
+}
+
+cmd_add() {
+  local mode=oneway args=() a
+  for a in "$@"; do
+    case "$a" in --two-way|--twoway) mode=twoway ;; *) args+=("$a") ;; esac
+  done
+  if [[ ${#args[@]} -lt 1 ]]; then
+    echo "usage: gdrive-autosync add <local_dir> [drive_path] [--two-way]"
+    exit 1
+  fi
+  local l r
+  l="$(realpath -m "${args[0]}")"
+  [[ -d "$l" ]] || { echo "No such directory: $l"; exit 1; }
+  r="${args[1]:-pc-backup/$(basename "$l")}"
+  mkdir -p "$CONF_DIR"; touch "$CONF"
+  local line f fe
+  while IFS= read -r line; do
+    f="${line%%|*}"; fe="${f/#\~/$HOME}"
+    [[ "$fe" == "$l" ]] && { echo "Already watched: $l"; exit 1; }
+  done < "$CONF"
+  echo "${l}|${r}|${mode}" >> "$CONF"
+  echo "Added ($mode): $l  ->  ${REMOTE}:$r"
+  restart_service
+}
+
+cmd_remove() {
+  [[ $# -ge 1 ]] || { echo "usage: gdrive-autosync remove <local_dir>"; exit 1; }
+  local l tmp line f fe found=0
+  l="$(realpath -m "$1")"
+  tmp="$(mktemp)"
+  while IFS= read -r line; do
+    f="${line%%|*}"; fe="${f/#\~/$HOME}"
+    if [[ "$fe" == "$l" ]]; then found=1; continue; fi
+    printf '%s\n' "$line"
+  done < "$CONF" > "$tmp"
+  mv "$tmp" "$CONF"
+  if [[ "$found" -eq 1 ]]; then
+    echo "Removed: $l (files already on Drive are kept)"
+    restart_service
+  else
+    echo "Not in config: $l"
+  fi
+}
+
+cmd_list() {
+  load_conf
+  if [[ ${#LOCALS[@]} -eq 0 ]]; then echo "No folders configured."; return; fi
+  local i
+  for i in "${!LOCALS[@]}"; do
+    printf '%-8s %s  ->  %s:%s\n' "[${MODES[$i]}]" "${LOCALS[$i]}" "$REMOTE" "${REMOTES[$i]}"
+  done
+}
+
+cmd_sync() {
+  load_conf
+  [[ ${#LOCALS[@]} -eq 0 ]] && { echo "No folders configured."; exit 1; }
+  sync_all
+}
+
+cmd_status() {
+  systemctl --user --no-pager status gdrive-autosync 2>/dev/null | head -8 || true
+  echo
+  cmd_list
+}
+
+cmd_log() { journalctl --user -u gdrive-autosync -f; }
+
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-help}" in
+  daemon)     cmd_daemon ;;
+  add)        shift; cmd_add "$@" ;;
+  remove|rm)  shift; cmd_remove "$@" ;;
+  list|ls)    cmd_list ;;
+  sync)       cmd_sync ;;
+  status)     cmd_status ;;
+  log|logs)   cmd_log ;;
+  help|-h|--help|*) usage ;;
+esac
