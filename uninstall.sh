@@ -1,11 +1,14 @@
 #!/bin/bash
-# Removes gdrive-autosync (keeps your config and rclone remote).
-set -euo pipefail
+# gsync uninstaller. Keeps your config (~/.config/gsync) and the rclone remote.
+set -u
 
-systemctl --user disable --now gdrive-autosync 2>/dev/null || true
-rm -f "$HOME/.config/systemd/user/gdrive-autosync.service"
+systemctl --user disable --now gsync-tray 2>/dev/null
+systemctl --user disable --now gsync 2>/dev/null
+rm -f "$HOME/.config/systemd/user/gsync.service" \
+      "$HOME/.config/systemd/user/gsync-tray.service"
 systemctl --user daemon-reload
-rm -f "$HOME/.local/bin/gdrive-autosync"
+rm -f "$HOME/.local/bin/gsync" "$HOME/.local/bin/gsync-tray"
 
-echo "Removed. Config kept at ~/.config/gdrive-autosync/ (delete manually if unwanted)."
-echo "The rclone 'gdrive' remote was also kept (remove with: rclone config delete gdrive)."
+echo "gsync removed."
+echo "Kept: ~/.config/gsync (config), ~/.local/state/gsync (state), rclone 'gdrive' remote."
+echo "Files on Google Drive are untouched."

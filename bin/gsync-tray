@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""
+gsync-tray: system tray indicator for gsync.
+
+Cloud icon states:
+  Grey         -> idle (watching, last sync OK)
+  Bright+arrow -> syncing right now
+  Amber "!"    -> last sync had errors
+  Slashed      -> paused (service stopped)
+
+Left-click: sync now. Right-click: menu (sync, add folder, pause/resume,
+log, quit). Autostarted via systemd user service (gsync-tray.service).
+Requires PyGObject + GTK3 + libayatana-appindicator (Gtk.StatusIcon fallback).
+"""
+import io
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+import cairo
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import GLib, Gtk, Gdk, GdkPixbuf  # noqa: E402
+
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
+
+    HAS_AYATANA = True
+except (ValueError, ImportError):
+    HAS_AYATANA = False
+
+SERVICE = "gsync.service"
+STATUS_FILE = os.path.expanduser("~/.local/state/gsync/status")
+POLL_SEC = 3
+ICON_SIZE = 24
+
+STATES = ("idle", "syncing", "error", "paused")
+
+
+def _service_active() -> bool:
+    r = subprocess.run(
+        ["systemctl", "--user", "is-active", SERVICE],
+        capture_output=True, text=True, timeout=5.0,
+    )
+    return r.stdout.strip() == "active"
+
+
+def _read_status():
+    """Returns (state, epoch) from the daemon's status file."""
+    try:
+        with open(STATUS_FILE) as f:
+            state, ts = f.read().strip().split("|", 1)
+        return state, int(ts)
+    except Exception:
+        return "idle", 0
+
+
+def _current_state() -> tuple:
+    if not _service_active():
+        return "paused", 0
+    state, ts = _read_status()
+    if state not in ("syncing", "error"):
+        state = "idle"
+    return state, ts
+
+
+def _draw_cloud(cr, color):
+    cr.set_source_rgb(*color)
+    cr.set_line_width(2.0)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.move_to(6.5, 16.5)
+    cr.curve_to(3.0, 16.5, 2.6, 11.8, 6.2, 11.2)
+    cr.curve_to(6.6, 8.0, 10.8, 6.8, 13.0, 9.0)
+    cr.curve_to(16.8, 7.4, 20.2, 10.2, 19.0, 13.2)
+    cr.curve_to(21.4, 13.8, 21.2, 16.5, 18.0, 16.5)
+    cr.close_path()
+    cr.stroke()
+
+
+def _render_surface(state: str) -> cairo.ImageSurface:
+    s = cairo.ImageSurface(cairo.FORMAT_ARGB32, ICON_SIZE, ICON_SIZE)
+    cr = cairo.Context(s)
+    cr.set_operator(cairo.OPERATOR_CLEAR)
+    cr.paint()
+    cr.set_operator(cairo.OPERATOR_OVER)
+    cr.scale(ICON_SIZE / 24, ICON_SIZE / 24)
+
+    grey = (0.62, 0.62, 0.62)
+    bright = (0.95, 0.95, 0.95)
+    amber = (0.95, 0.72, 0.25)
+    dark = (0.45, 0.45, 0.45)
+
+    if state == "syncing":
+        _draw_cloud(cr, bright)
+        cr.set_source_rgb(*bright)
+        cr.set_line_width(1.8)
+        cr.move_to(12, 15.2)
+        cr.line_to(12, 11.2)
+        cr.stroke()
+        cr.move_to(10.2, 12.8)
+        cr.line_to(12, 11.0)
+        cr.line_to(13.8, 12.8)
+        cr.stroke()
+    elif state == "error":
+        _draw_cloud(cr, amber)
+        cr.set_source_rgb(*amber)
+        cr.set_line_width(1.9)
+        cr.move_to(12, 10.6)
+        cr.line_to(12, 13.4)
+        cr.stroke()
+        cr.arc(12, 15.4, 0.55, 0, 6.3)
+        cr.fill()
+    elif state == "paused":
+        _draw_cloud(cr, dark)
+        cr.set_source_rgb(*dark)
+        cr.set_line_width(1.8)
+        cr.move_to(6.0, 19.0)
+        cr.line_to(19.0, 6.0)
+        cr.stroke()
+    else:  # idle
+        _draw_cloud(cr, grey)
+
+    return s
+
+
+def _render_pixbuf(state: str) -> GdkPixbuf.Pixbuf:
+    return Gdk.pixbuf_get_from_surface(
+        _render_surface(state), 0, 0, ICON_SIZE, ICON_SIZE
+    )
+
+
+def _render_png(state: str) -> bytes:
+    s = _render_surface(state)
+    buf = io.BytesIO()
+    s.write_to_png(buf)
+    return buf.getvalue()
+
+
+def _gsync_list() -> list:
+    try:
+        r = subprocess.run(["gsync", "list"], capture_output=True, text=True, timeout=10.0)
+        lines = [ln for ln in r.stdout.strip().splitlines() if ln.startswith("[")]
+        return lines
+    except Exception:
+        return []
+
+
+class TrayIndicator:
+    def __init__(self) -> None:
+        self._tmpdir = tempfile.mkdtemp(prefix="gsync-")
+        self._icon_paths = {}
+        for st in STATES:
+            path = os.path.join(self._tmpdir, f"{st}.png")
+            with open(path, "wb") as f:
+                f.write(_render_png(st))
+            self._icon_paths[st] = path
+
+        self.state = "idle"
+        self.last_ts = 0
+
+        if HAS_AYATANA:
+            self._indicator = AppIndicator.Indicator.new(
+                "gsync", "", AppIndicator.IndicatorCategory.APPLICATION_STATUS
+            )
+            self._indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+            self._indicator.set_icon_full(self._icon_paths["idle"], "gsync")
+            self._menu = Gtk.Menu()
+            self._indicator.set_menu(self._menu)
+        else:
+            self._icon = Gtk.StatusIcon()
+            self._icon.set_from_pixbuf(_render_pixbuf("idle"))
+            self._icon.connect("popup-menu", self._on_popup_menu)
+            self._icon.connect("activate", lambda *_: self._sync_now())
+
+        self._update()
+        GLib.timeout_add_seconds(POLL_SEC, self._update)
+
+    # ---------- status text ----------
+
+    def _status_text(self) -> str:
+        if self.state == "syncing":
+            return "Syncing…"
+        if self.state == "error":
+            return "Error — check log"
+        if self.state == "paused":
+            return "Paused"
+        if self.last_ts:
+            return "Idle — last sync " + time.strftime("%H:%M", time.localtime(self.last_ts))
+        return "Idle"
+
+    # ---------- menu ----------
+
+    def _build_menu(self, menu: Gtk.Menu) -> None:
+        for child in menu.get_children():
+            menu.remove(child)
+            child.destroy()
+
+        item = Gtk.MenuItem(label=self._status_text())
+        item.set_sensitive(False)
+        menu.append(item)
+
+        folders = _gsync_list()
+        if folders:
+            sub = Gtk.Menu()
+            for ln in folders:
+                fi = Gtk.MenuItem(label=ln)
+                fi.set_sensitive(False)
+                sub.append(fi)
+            root = Gtk.MenuItem(label=f"Watched folders ({len(folders)})")
+            root.set_submenu(sub)
+            menu.append(root)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        item = Gtk.MenuItem(label="Sync now")
+        item.connect("activate", lambda *_: self._sync_now())
+        menu.append(item)
+
+        item = Gtk.MenuItem(label="Add folder…")
+        item.connect("activate", lambda *_: self._add_folder())
+        menu.append(item)
+
+        if self.state == "paused":
+            item = Gtk.MenuItem(label="Resume syncing")
+            item.connect("activate", lambda *_: self._ctl("start"))
+        else:
+            item = Gtk.MenuItem(label="Pause syncing")
+            item.connect("activate", lambda *_: self._ctl("stop"))
+        menu.append(item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        item = Gtk.MenuItem(label="View log")
+        item.connect("activate", lambda *_: self._open_log())
+        menu.append(item)
+
+        item = Gtk.MenuItem(label="Quit tray")
+        item.connect("activate", lambda *_: Gtk.main_quit())
+        menu.append(item)
+
+        menu.show_all()
+
+    def _on_popup_menu(self, icon, button, activate_time) -> None:
+        menu = Gtk.Menu()
+        self._build_menu(menu)
+        menu.popup(None, None, Gtk.StatusIcon.position_menu, icon, button, activate_time)
+
+    # ---------- actions ----------
+
+    def _ctl(self, action: str) -> None:
+        subprocess.Popen(
+            ["systemctl", "--user", action, SERVICE],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        GLib.timeout_add(600, self._update)
+
+    def _sync_now(self) -> None:
+        if self.state == "paused":
+            self._ctl("start")
+            return
+        subprocess.Popen(
+            ["gsync", "sync"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        GLib.timeout_add(600, self._update)
+
+    def _add_folder(self) -> None:
+        dialog = Gtk.FileChooserDialog(
+            title="gsync — choose a folder to watch",
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            "Watch this folder", Gtk.ResponseType.OK,
+        )
+        response = dialog.run()
+        path = dialog.get_filename()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK or not path:
+            return
+        r = subprocess.run(["gsync", "add", path], capture_output=True, text=True)
+        msg = (r.stdout or r.stderr or "").strip() or "Done."
+        subprocess.Popen(
+            ["notify-send", "--app-name=gsync", "gsync", msg],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        GLib.timeout_add(600, self._update)
+
+    def _open_log(self) -> None:
+        script = "journalctl --user -u gsync -f"
+        for cmd in (
+            ["gnome-terminal", "--", "bash", "-lc", script],
+            ["kgx", "--", "bash", "-lc", script],
+            ["x-terminal-emulator", "-e", "bash", "-lc", script],
+        ):
+            if shutil.which(cmd[0]):
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+
+    # ---------- refresh ----------
+
+    def _update(self) -> bool:
+        try:
+            self.state, self.last_ts = _current_state()
+        except Exception:
+            self.state = "idle"
+
+        tooltip = "gsync: " + self._status_text()
+        if HAS_AYATANA:
+            self._indicator.set_icon_full(self._icon_paths[self.state], tooltip)
+            self._build_menu(self._menu)
+        else:
+            self._icon.set_from_pixbuf(_render_pixbuf(self.state))
+            self._icon.set_tooltip_text(tooltip)
+        return True
+
+
+def main() -> int:
+    if "DISPLAY" not in os.environ and "WAYLAND_DISPLAY" not in os.environ:
+        print("gsync-tray: no display found.", file=sys.stderr)
+        return 1
+    Gtk.init()
+    TrayIndicator()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,23 +1,25 @@
 #!/bin/bash
-# gdrive-autosync — event-driven folder sync to Google Drive (rclone + inotify).
+# gsync — event-driven folder sync to Google Drive (rclone + inotify).
 #
-#   gdrive-autosync add <dir> [drive_path] [--two-way]   watch a folder
-#   gdrive-autosync remove <dir>                         stop watching a folder
-#   gdrive-autosync list                                 show watched folders
-#   gdrive-autosync sync                                 force a sync pass now
-#   gdrive-autosync status                               service state
-#   gdrive-autosync log                                  follow live log
-#   gdrive-autosync daemon                               run watcher (systemd uses this)
+#   gsync add <dir> [drive_path] [--two-way]   watch a folder
+#   gsync remove <dir>                         stop watching a folder
+#   gsync list                                 show watched folders
+#   gsync sync                                 force a sync pass now
+#   gsync pause / resume                       stop / start the watcher service
+#   gsync status                               service state
+#   gsync log                                  follow live log
+#   gsync daemon                               run watcher (systemd uses this)
 #
 # Modes: oneway (default) mirrors local -> Drive (backup semantics).
 #        twoway uses rclone bisync; remote changes flow back too.
 set -u
 
-CONF_DIR="$HOME/.config/gdrive-autosync"
+CONF_DIR="$HOME/.config/gsync"
 CONF="$CONF_DIR/folders.conf"
-STATE_DIR="$HOME/.local/state/gdrive-autosync"
-REMOTE="${GDRIVE_REMOTE:-gdrive}"
-QUIET="${GDRIVE_QUIET_SECONDS:-15}"
+STATE_DIR="$HOME/.local/state/gsync"
+STATUS_FILE="$STATE_DIR/status"
+REMOTE="${GSYNC_REMOTE:-gdrive}"
+QUIET="${GSYNC_QUIET_SECONDS:-15}"
 
 EXCLUDES=(
   --exclude 'node_modules/**'
@@ -31,6 +33,12 @@ EXCLUDES=(
 )
 
 declare -a LOCALS REMOTES MODES
+FAILED=0
+
+set_status() { # syncing | idle | error
+  mkdir -p "$STATE_DIR"
+  printf '%s|%s\n' "$1" "$(date +%s)" > "$STATUS_FILE"
+}
 
 load_conf() {
   LOCALS=(); REMOTES=(); MODES=()
@@ -55,24 +63,27 @@ sync_one() {
     if [[ ! -f "$marker" ]]; then
       echo "bisync (first run, --resync): $l <-> ${REMOTE}:$r"
       rclone bisync "$l" "${REMOTE}:$r" --resync "${EXCLUDES[@]}" && touch "$marker" \
-        || echo "ERROR: initial bisync failed: $l"
+        || { echo "ERROR: initial bisync failed: $l"; FAILED=1; }
     else
       echo "bisync: $l <-> ${REMOTE}:$r"
       rclone bisync "$l" "${REMOTE}:$r" "${EXCLUDES[@]}" \
-        || echo "ERROR: bisync failed: $l  (to force recovery: rm $marker)"
+        || { echo "ERROR: bisync failed: $l  (to force recovery: rm $marker)"; FAILED=1; }
     fi
   else
     echo "sync: $l -> ${REMOTE}:$r"
     rclone sync "$l" "${REMOTE}:$r" "${EXCLUDES[@]}" \
-      || echo "ERROR: sync failed: $l"
+      || { echo "ERROR: sync failed: $l"; FAILED=1; }
   fi
 }
 
 sync_all() {
+  FAILED=0
+  set_status syncing
   local i
   for i in "${!LOCALS[@]}"; do
     sync_one "${LOCALS[$i]}" "${REMOTES[$i]}" "${MODES[$i]}"
   done
+  [[ "$FAILED" -eq 0 ]] && set_status idle || set_status error
 }
 
 poll_interval() {
@@ -85,15 +96,16 @@ poll_interval() {
 }
 
 restart_service() {
-  if systemctl --user is-active -q gdrive-autosync 2>/dev/null; then
-    systemctl --user restart gdrive-autosync && echo "Service restarted."
+  if systemctl --user is-active -q gsync 2>/dev/null; then
+    systemctl --user restart gsync && echo "Service restarted."
   fi
 }
 
 cmd_daemon() {
   load_conf
   if [[ ${#LOCALS[@]} -eq 0 ]]; then
-    echo "No folders configured. Add one with: gdrive-autosync add <dir>"
+    echo "No folders configured. Add one with: gsync add <dir>"
+    set_status idle
     exit 1
   fi
   echo "Initial sync (${#LOCALS[@]} folder(s))..."
@@ -115,7 +127,7 @@ cmd_add() {
     case "$a" in --two-way|--twoway) mode=twoway ;; *) args+=("$a") ;; esac
   done
   if [[ ${#args[@]} -lt 1 ]]; then
-    echo "usage: gdrive-autosync add <local_dir> [drive_path] [--two-way]"
+    echo "usage: gsync add <local_dir> [drive_path] [--two-way]"
     exit 1
   fi
   local l r
@@ -134,7 +146,7 @@ cmd_add() {
 }
 
 cmd_remove() {
-  [[ $# -ge 1 ]] || { echo "usage: gdrive-autosync remove <local_dir>"; exit 1; }
+  [[ $# -ge 1 ]] || { echo "usage: gsync remove <local_dir>"; exit 1; }
   local l tmp line f fe found=0
   l="$(realpath -m "$1")"
   tmp="$(mktemp)"
@@ -168,14 +180,21 @@ cmd_sync() {
 }
 
 cmd_status() {
-  systemctl --user --no-pager status gdrive-autosync 2>/dev/null | head -8 || true
+  local svc="stopped"
+  systemctl --user is-active -q gsync 2>/dev/null && svc="running"
+  local st="-" ts="-"
+  if [[ -f "$STATUS_FILE" ]]; then
+    IFS='|' read -r st ts < "$STATUS_FILE"
+    ts="$(date -d "@$ts" '+%H:%M:%S' 2>/dev/null || echo '-')"
+  fi
+  echo "service: $svc   last state: $st ($ts)"
   echo
   cmd_list
 }
 
-cmd_log() { journalctl --user -u gdrive-autosync -f; }
+cmd_log() { journalctl --user -u gsync -f; }
 
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
   daemon)     cmd_daemon ;;
@@ -183,6 +202,8 @@ case "${1:-help}" in
   remove|rm)  shift; cmd_remove "$@" ;;
   list|ls)    cmd_list ;;
   sync)       cmd_sync ;;
+  pause)      systemctl --user stop gsync && echo "Paused." ;;
+  resume)     systemctl --user start gsync && echo "Resumed." ;;
   status)     cmd_status ;;
   log|logs)   cmd_log ;;
   help|-h|--help|*) usage ;;

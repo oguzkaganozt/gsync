@@ -1,0 +1,13 @@
+[Unit]
+Description=gsync — event-driven folder sync to Google Drive
+Documentation=https://github.com/oguzkaganozt/gsync
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/gsync daemon
+Restart=on-failure
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=default.target
