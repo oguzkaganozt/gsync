@@ -53,6 +53,16 @@ fetch "bin/gsync-tray"             "$HOME/.local/bin/gsync-tray"                
 fetch "systemd/gsync.service"      "$HOME/.config/systemd/user/gsync.service"          644
 fetch "systemd/gsync-tray.service" "$HOME/.config/systemd/user/gsync-tray.service"     644
 
+# File-manager right-click integration (Nautilus / Nemo "Scripts" menu)
+if command -v nautilus >/dev/null || [[ -d "$HOME/.local/share/nautilus" ]]; then
+  fetch "share/filemanager/Add to gsync" "$HOME/.local/share/nautilus/scripts/Add to gsync" 755
+  echo "    Nautilus: right-click a folder -> Scripts -> 'Add to gsync'"
+fi
+if command -v nemo >/dev/null || [[ -d "$HOME/.local/share/nemo" ]]; then
+  fetch "share/filemanager/Add to gsync" "$HOME/.local/share/nemo/scripts/Add to gsync" 755
+  echo "    Nemo: right-click a folder -> Scripts -> 'Add to gsync'"
+fi
+
 # Migrate from the old gdrive-autosync name, if present
 OLD_CONF="$HOME/.config/gdrive-autosync/folders.conf"
 if [[ -f "$OLD_CONF" && ! -f "$CONF" ]]; then

@@ -1,0 +1,24 @@
+#!/bin/bash
+# gsync file-manager context menu script (Nautilus/Nemo "Scripts" mechanism).
+# Right-click a folder -> Scripts -> "Add to gsync" starts watching it.
+# Right-clicking a file adds the file's parent folder (gsync watches folders).
+
+notify() {
+  command -v notify-send >/dev/null && notify-send --app-name=gsync "gsync" "$1"
+}
+
+PATHS="${NAUTILUS_SCRIPT_SELECTED_FILE_PATHS:-${NEMO_SCRIPT_SELECTED_FILE_PATHS:-}}"
+[[ -z "$PATHS" ]] && { notify "Nothing selected."; exit 0; }
+
+msgs=()
+while IFS= read -r p; do
+  [[ -z "$p" ]] && continue
+  if [[ -f "$p" ]]; then
+    p="$(dirname "$p")"
+    msgs+=("(file selected — watching its folder instead)")
+  fi
+  out="$("$HOME/.local/bin/gsync" add "$p" 2>&1)"
+  msgs+=("$out")
+done <<< "$PATHS"
+
+notify "$(printf '%s\n' "${msgs[@]}")"
