@@ -17,6 +17,7 @@ from gi.repository import Nautilus, GObject  # noqa: E402
 
 GSYNC = os.path.expanduser("~/.local/bin/gsync")
 CONF = os.path.expanduser("~/.config/gsync/folders.conf")
+MOUNT = os.path.expanduser(os.environ.get("GSYNC_MOUNT", "~/GoogleDrive"))
 
 
 def _watched_dirs():
@@ -53,7 +54,11 @@ def _target_dir(file_info):
     p = _path_of(file_info)
     if p is None:
         return None
-    return p if os.path.isdir(p) else os.path.dirname(p)
+    p = p if os.path.isdir(p) else os.path.dirname(p)
+    # Paths on the Drive mount are already on Drive — offer no menu there.
+    if p == MOUNT or p.startswith(MOUNT + os.sep):
+        return None
+    return p
 
 
 class GsyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
@@ -72,16 +77,16 @@ class GsyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
         if add_paths:
             it = Nautilus.MenuItem(
                 name="GsyncMenuProvider::add",
-                label="Add to gsync",
-                tip="Watch this folder and back it up to Google Drive",
+                label="Sync to Google Drive",
+                tip="Keep this folder continuously synced to Google Drive",
             )
             it.connect("activate", lambda _i: self._run("add", add_paths))
             items.append(it)
         if rm_paths:
             it = Nautilus.MenuItem(
                 name="GsyncMenuProvider::remove",
-                label="Remove from gsync",
-                tip="Stop watching this folder (Drive files are kept)",
+                label="Stop syncing this folder",
+                tip="Stop syncing (files already on Drive are kept)",
             )
             it.connect("activate", lambda _i: self._run("remove", rm_paths))
             items.append(it)

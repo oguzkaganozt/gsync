@@ -25,9 +25,15 @@ fetch() { # fetch <repo-relative-path> <dest> <mode>
 
 echo "==> Checking dependencies"
 if ! command -v rclone >/dev/null; then
-  echo "rclone not found. Install it first:"
-  echo "  sudo apt install rclone      # or: curl https://rclone.org/install.sh | sudo bash"
+  echo "rclone not found. Install the official build (recommended):"
+  echo "  curl https://rclone.org/install.sh | sudo bash"
   exit 1
+fi
+# Old rclone builds (< 1.66) have a rough bisync; warn if twoway may be used.
+RCLONE_VER=$(rclone version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+if [[ -n "$RCLONE_VER" ]] && awk "BEGIN{exit !($RCLONE_VER < 1.66)}"; then
+  echo "NOTE: rclone $RCLONE_VER is old. For reliable --two-way folders, upgrade:"
+  echo "  curl https://rclone.org/install.sh | sudo bash"
 fi
 
 APT_PKGS=()
@@ -66,11 +72,13 @@ if command -v nautilus >/dev/null; then
         "$HOME/.local/share/nautilus-python/extensions/gsync_extension.py" 644
   rm -f "$HOME/.local/share/nautilus/scripts/Add to gsync"  # old Scripts variant
   nautilus -q 2>/dev/null || true   # reload extensions (closes open file windows)
-  echo "    Nautilus: right-click a folder -> 'Add to gsync' / 'Remove from gsync'"
+  echo "    Nautilus: right-click a folder -> 'Sync to Google Drive'"
 fi
 if command -v nemo >/dev/null || [[ -d "$HOME/.local/share/nemo" ]]; then
-  fetch "share/filemanager/Add to gsync" "$HOME/.local/share/nemo/scripts/Add to gsync" 755
-  echo "    Nemo: right-click a folder -> Scripts -> 'Add to gsync'"
+  rm -f "$HOME/.local/share/nemo/scripts/Add to gsync"  # old name
+  fetch "share/filemanager/sync-to-google-drive" \
+        "$HOME/.local/share/nemo/scripts/Sync to Google Drive" 755
+  echo "    Nemo: right-click a folder -> Scripts -> 'Sync to Google Drive'"
 fi
 
 # Migrate from the old gdrive-autosync name, if present

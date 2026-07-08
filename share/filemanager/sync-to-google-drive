@@ -1,7 +1,7 @@
 #!/bin/bash
-# gsync file-manager context menu script (Nautilus/Nemo "Scripts" mechanism).
-# Right-click a folder -> Scripts -> "Add to gsync" starts watching it.
-# Right-clicking a file adds the file's parent folder (gsync watches folders).
+# gsync file-manager context menu script (Nemo "Scripts" mechanism).
+# Installed as "Sync to Google Drive" — right-click a folder to start syncing it.
+# Right-clicking a file targets the file's parent folder (gsync syncs folders).
 
 notify() {
   command -v notify-send >/dev/null && notify-send --app-name=gsync "gsync" "$1"
@@ -15,7 +15,7 @@ while IFS= read -r p; do
   [[ -z "$p" ]] && continue
   if [[ -f "$p" ]]; then
     p="$(dirname "$p")"
-    msgs+=("(file selected — watching its folder instead)")
+    msgs+=("(file selected — syncing its folder instead)")
   fi
   out="$("$HOME/.local/bin/gsync" add "$p" 2>&1)"
   msgs+=("$out")

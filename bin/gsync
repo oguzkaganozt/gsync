@@ -22,6 +22,9 @@ STATUS_FILE="$STATE_DIR/status"
 REMOTE="${GSYNC_REMOTE:-gdrive}"
 QUIET="${GSYNC_QUIET_SECONDS:-15}"
 ROOT="${GSYNC_ROOT:-gsync/$(hostname)}"   # default Drive root for new folders
+MOUNT="${GSYNC_MOUNT:-$HOME/GoogleDrive}" # rclone mount location (gsync-mount.service)
+ARCHIVE="gsync/.archive/$(hostname)"      # deleted/overwritten files parked here, 30d
+ARCHIVE_KEEP_DAYS="${GSYNC_ARCHIVE_DAYS:-30}"
 
 EXCLUDES=(
   --exclude 'node_modules/**'
@@ -73,9 +76,33 @@ sync_one() {
     fi
   else
     echo "sync: $l -> ${REMOTE}:$r"
+    # --backup-dir: anything deleted/overwritten is parked under a dated
+    # archive folder instead of vanishing (server-side move, cheap).
     rclone sync "$l" "${REMOTE}:$r" "${EXCLUDES[@]}" \
+      --backup-dir "${REMOTE}:${ARCHIVE}/$(date +%F)/$r" \
       || { echo "ERROR: sync failed: $l"; FAILED=1; }
   fi
+}
+
+cleanup_archive() {
+  # Once a day, drop archive date-folders older than ARCHIVE_KEEP_DAYS.
+  # Keyed on the folder NAME (= archive date), not file mtimes — rclone's
+  # --min-age would look at original file mtimes and delete fresh archives.
+  local stamp="$STATE_DIR/last-archive-cleanup" now last=0
+  now=$(date +%s)
+  [[ -f "$stamp" ]] && last=$(cat "$stamp" 2>/dev/null || echo 0)
+  (( now - last < 86400 )) && return 0
+  mkdir -p "$STATE_DIR"; echo "$now" > "$stamp"
+  local cutoff d
+  cutoff=$(date -d "$ARCHIVE_KEEP_DAYS days ago" +%F)
+  rclone lsf "${REMOTE}:${ARCHIVE}" --dirs-only 2>/dev/null | while IFS= read -r d; do
+    d="${d%/}"
+    [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+    if [[ "$d" < "$cutoff" ]]; then
+      echo "archive cleanup: removing ${ARCHIVE}/$d"
+      rclone purge "${REMOTE}:${ARCHIVE}/$d" 2>/dev/null || true
+    fi
+  done
 }
 
 sync_all() {
@@ -112,6 +139,7 @@ cmd_daemon() {
   fi
   echo "Initial sync (${#LOCALS[@]} folder(s))..."
   sync_all
+  cleanup_archive
   echo "Watching: ${LOCALS[*]}"
   while :; do
     inotifywait -r -q -t "$(poll_interval)" \
@@ -120,6 +148,7 @@ cmd_daemon() {
     sleep "$QUIET"
     load_conf
     sync_all
+    cleanup_archive
   done
 }
 
@@ -135,12 +164,33 @@ cmd_add() {
   local l r
   l="$(realpath -m "${args[0]}")"
   [[ -d "$l" ]] || { echo "No such directory: $l"; exit 1; }
+
+  # Guard 1: paths on the Drive mount are already on Drive — syncing is meaningless.
+  if [[ "$l" == "$MOUNT" || "$l" == "$MOUNT"/* ]]; then
+    echo "This folder is already on Google Drive (it lives on the ~/GoogleDrive mount)."
+    echo "No sync needed — files there are stored in Drive directly."
+    exit 1
+  fi
+  # Guard 2: a path that CONTAINS the mount would recursively pull your whole
+  # Drive through the mount (huge traffic, sync loop). Refuse.
+  if [[ "$MOUNT" == "$l"/* ]]; then
+    echo "Refusing: $l contains the Google Drive mount ($MOUNT)."
+    echo "Watching it would recursively download/re-upload your whole Drive."
+    echo "Pick specific subfolders instead."
+    exit 1
+  fi
+
   r="${args[1]:-$ROOT/$(basename "$l")}"
   mkdir -p "$CONF_DIR"; touch "$CONF"
   local line f fe
   while IFS= read -r line; do
-    f="${line%%|*}"; fe="${f/#\~/$HOME}"
+    f="${line%%|*}"
+    [[ -z "${f// }" || "$f" == \#* ]] && continue
+    fe="${f/#\~/$HOME}"
     [[ "$fe" == "$l" ]] && { echo "Already watched: $l"; exit 1; }
+    # Guard 3: nested watches sync the same data twice — confusing and wasteful.
+    [[ "$l" == "$fe"/* ]] && { echo "Refusing: $l is inside already-watched $fe."; exit 1; }
+    [[ "$fe" == "$l"/* ]] && { echo "Refusing: $l contains already-watched $fe. Remove it first: gsync remove $fe"; exit 1; }
   done < "$CONF"
   echo "${l}|${r}|${mode}" >> "$CONF"
   echo "Added ($mode): $l  ->  ${REMOTE}:$r"

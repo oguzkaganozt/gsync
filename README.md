@@ -5,11 +5,17 @@ system tray icon.
 
 Two things in one tool:
 
-1. **Watch & back up** — pick local folders; they sync to Drive the moment
-   they change.
+1. **Sync** — pick local folders; they mirror to Drive the moment they change.
 2. **Browse & edit** — your whole Drive is mounted at `~/GoogleDrive`
    (also in the Files sidebar as "Google Drive"). Files stream on demand,
    nothing is downloaded until you open it; edits upload automatically.
+
+**How to think about it — one question:** *where should this live?*
+
+- "It should just be in the cloud, reachable anywhere" → put it in
+  `~/GoogleDrive`. Done, no setup.
+- "It must live on my disk (code, projects, tool-heavy folders) but must
+  survive disk death" → right-click → **Sync to Google Drive**.
 
 Pick folders; gsync watches them with **inotify** and syncs to Google Drive
 with **rclone** the moment something changes (15s quiet window merges rapid
@@ -28,10 +34,30 @@ Everything starts automatically at login and recovers on failure
 (systemd user services).
 
 File-manager integration: in GNOME Files (Nautilus), right-click any folder →
-**Add to gsync** (top-level menu item; watched folders show **Remove from
-gsync** instead). Right-clicking a file targets the file's folder. Works on
-the open folder's empty space too. Nemo users get the same via
-**Scripts → Add to gsync**.
+**Sync to Google Drive** (top-level menu item; synced folders show **Stop
+syncing this folder** instead; the menu is hidden inside `~/GoogleDrive`,
+where syncing makes no sense). Right-clicking a file targets the file's
+folder. Works on the open folder's empty space too. Nemo users get the same
+via **Scripts → Sync to Google Drive**.
+
+## Safety net
+
+Sync mirrors your disk — so a local mistake would normally mirror too.
+To make mistakes recoverable, anything deleted or overwritten on the Drive
+side is parked (server-side move, instant) under a dated archive:
+
+```
+gsync/.archive/<hostname>/<YYYY-MM-DD>/<original path>
+```
+
+Archives older than 30 days are cleaned up automatically
+(`GSYNC_ARCHIVE_DAYS` to change). Drive's own trash and file versions add a
+second layer. Note: the archive applies to **oneway** folders; twoway
+(bisync) folders rely on Drive trash and rclone's conflict copies.
+
+Guards you don't have to think about: gsync refuses to sync paths inside
+`~/GoogleDrive` (already on Drive), paths that *contain* the mount (would
+recursively pull your whole Drive), and nested/overlapping synced folders.
 
 Two modes, per folder:
 
