@@ -20,6 +20,7 @@ STATE_DIR="$HOME/.local/state/gsync"
 STATUS_FILE="$STATE_DIR/status"
 REMOTE="${GSYNC_REMOTE:-gdrive}"
 QUIET="${GSYNC_QUIET_SECONDS:-15}"
+ROOT="${GSYNC_ROOT:-gsync/$(hostname)}"   # default Drive root for new folders
 
 EXCLUDES=(
   --exclude 'node_modules/**'
@@ -133,7 +134,7 @@ cmd_add() {
   local l r
   l="$(realpath -m "${args[0]}")"
   [[ -d "$l" ]] || { echo "No such directory: $l"; exit 1; }
-  r="${args[1]:-pc-backup/$(basename "$l")}"
+  r="${args[1]:-$ROOT/$(basename "$l")}"
   mkdir -p "$CONF_DIR"; touch "$CONF"
   local line f fe
   while IFS= read -r line; do

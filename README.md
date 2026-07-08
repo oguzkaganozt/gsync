@@ -47,7 +47,7 @@ daemon + tray as systemd user services, and migrates config from the old
 ## CLI
 
 ```bash
-gsync add ~/Documents                     # watch (oneway, -> pc-backup/Documents)
+gsync add ~/Documents                     # watch (oneway, -> gsync/<hostname>/Documents)
 gsync add ~/notes shared/notes --two-way  # custom Drive path, bidirectional
 gsync list                                # what's being watched
 gsync remove ~/Documents                  # stop watching (Drive files kept)
@@ -65,4 +65,7 @@ Default excludes: `node_modules`, `.cache`, `__pycache__`, `.venv`,
 `target`, `build`, `*.tmp`, `*.swp`.
 
 Environment overrides: `GSYNC_REMOTE` (default `gdrive`),
-`GSYNC_QUIET_SECONDS` (default `15`).
+`GSYNC_QUIET_SECONDS` (default `15`), `GSYNC_ROOT` (default
+`gsync/<hostname>` — per-machine Drive root, so several machines can run
+gsync against the same account without colliding; use an explicit custom
+path when you *want* machines to share one folder).
