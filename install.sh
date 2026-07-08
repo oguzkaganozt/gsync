@@ -36,6 +36,9 @@ python3 -c "import gi, cairo" 2>/dev/null || APT_PKGS+=(python3-gi python3-gi-ca
 python3 -c "import gi; gi.require_version('AyatanaAppIndicator3','0.1')" 2>/dev/null \
   || APT_PKGS+=(gir1.2-ayatanaappindicator3-0.1)
 command -v notify-send >/dev/null || APT_PKGS+=(libnotify-bin)
+if command -v nautilus >/dev/null && ! dpkg -s python3-nautilus >/dev/null 2>&1; then
+  APT_PKGS+=(python3-nautilus)
+fi
 if [[ ${#APT_PKGS[@]} -gt 0 ]]; then
   echo "Installing packages: ${APT_PKGS[*]} (sudo required)"
   sudo apt-get install -y "${APT_PKGS[@]}"
@@ -53,10 +56,14 @@ fetch "bin/gsync-tray"             "$HOME/.local/bin/gsync-tray"                
 fetch "systemd/gsync.service"      "$HOME/.config/systemd/user/gsync.service"          644
 fetch "systemd/gsync-tray.service" "$HOME/.config/systemd/user/gsync-tray.service"     644
 
-# File-manager right-click integration (Nautilus / Nemo "Scripts" menu)
-if command -v nautilus >/dev/null || [[ -d "$HOME/.local/share/nautilus" ]]; then
-  fetch "share/filemanager/Add to gsync" "$HOME/.local/share/nautilus/scripts/Add to gsync" 755
-  echo "    Nautilus: right-click a folder -> Scripts -> 'Add to gsync'"
+# File-manager right-click integration
+if command -v nautilus >/dev/null; then
+  # Top-level context menu via nautilus-python extension
+  fetch "share/filemanager/gsync_extension.py" \
+        "$HOME/.local/share/nautilus-python/extensions/gsync_extension.py" 644
+  rm -f "$HOME/.local/share/nautilus/scripts/Add to gsync"  # old Scripts variant
+  nautilus -q 2>/dev/null || true   # reload extensions (closes open file windows)
+  echo "    Nautilus: right-click a folder -> 'Add to gsync' / 'Remove from gsync'"
 fi
 if command -v nemo >/dev/null || [[ -d "$HOME/.local/share/nemo" ]]; then
   fetch "share/filemanager/Add to gsync" "$HOME/.local/share/nemo/scripts/Add to gsync" 755

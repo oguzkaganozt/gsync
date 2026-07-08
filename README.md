@@ -18,9 +18,11 @@ add folder via a folder picker, pause/resume, view log, watched-folder list).
 Everything starts automatically at login and recovers on failure
 (systemd user services).
 
-File-manager integration: in GNOME Files (Nautilus) or Nemo, right-click any
-folder → **Scripts → Add to gsync** and it's watched from that moment
-(right-clicking a file adds the file's folder).
+File-manager integration: in GNOME Files (Nautilus), right-click any folder →
+**Add to gsync** (top-level menu item; watched folders show **Remove from
+gsync** instead). Right-clicking a file targets the file's folder. Works on
+the open folder's empty space too. Nemo users get the same via
+**Scripts → Add to gsync**.
 
 Two modes, per folder:
 
