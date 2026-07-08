@@ -35,6 +35,8 @@ except (ValueError, ImportError):
     HAS_AYATANA = False
 
 SERVICE = "gsync.service"
+# Absolute path: under systemd --user, PATH does not include ~/.local/bin.
+GSYNC_BIN = os.path.expanduser("~/.local/bin/gsync")
 STATUS_FILE = os.path.expanduser("~/.local/state/gsync/status")
 POLL_SEC = 3
 ICON_SIZE = 24
@@ -144,7 +146,7 @@ def _render_png(state: str) -> bytes:
 
 def _gsync_list() -> list:
     try:
-        r = subprocess.run(["gsync", "list"], capture_output=True, text=True, timeout=10.0)
+        r = subprocess.run([GSYNC_BIN, "list"], capture_output=True, text=True, timeout=10.0)
         lines = [ln for ln in r.stdout.strip().splitlines() if ln.startswith("[")]
         return lines
     except Exception:
@@ -229,7 +231,7 @@ class TrayIndicator:
 
         item = Gtk.MenuItem(label="Open Google Drive")
         item.connect("activate", lambda *_: subprocess.Popen(
-            [os.path.expanduser("~/.local/bin/gsync"), "open"],
+            [GSYNC_BIN, "open"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         ))
         menu.append(item)
@@ -273,7 +275,7 @@ class TrayIndicator:
             self._ctl("start")
             return
         subprocess.Popen(
-            ["gsync", "sync"],
+            [GSYNC_BIN, "sync"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         GLib.timeout_add(600, self._update)
@@ -292,7 +294,7 @@ class TrayIndicator:
         dialog.destroy()
         if response != Gtk.ResponseType.OK or not path:
             return
-        r = subprocess.run(["gsync", "add", path], capture_output=True, text=True)
+        r = subprocess.run([GSYNC_BIN, "add", path], capture_output=True, text=True)
         msg = (r.stdout or r.stderr or "").strip() or "Done."
         subprocess.Popen(
             ["notify-send", "--app-name=gsync", "gsync", msg],

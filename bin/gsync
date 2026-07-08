@@ -11,7 +11,7 @@
 #   gsync log                                  follow live log
 #   gsync daemon                               run watcher (systemd uses this)
 #
-# Modes: oneway (default) mirrors local -> Drive (backup semantics).
+# Modes: oneway (default) mirrors local -> Drive (disk is the source of truth).
 #        twoway uses rclone bisync; remote changes flow back too.
 set -u
 
@@ -132,19 +132,34 @@ restart_service() {
 
 cmd_daemon() {
   load_conf
+  # No folders yet is not an error: wait for config instead of crash-looping
+  # under systemd's Restart=on-failure.
   if [[ ${#LOCALS[@]} -eq 0 ]]; then
-    echo "No folders configured. Add one with: gsync add <dir>"
+    echo "No folders configured yet — waiting. Add one with: gsync add <dir>"
     set_status idle
-    exit 1
+    while [[ ${#LOCALS[@]} -eq 0 ]]; do
+      sleep 60
+      load_conf
+    done
+    echo "Configuration found (${#LOCALS[@]} folder(s))."
   fi
   echo "Initial sync (${#LOCALS[@]} folder(s))..."
   sync_all
   cleanup_archive
   echo "Watching: ${LOCALS[*]}"
+  local rc
   while :; do
     inotifywait -r -q -t "$(poll_interval)" \
       -e create -e modify -e delete -e move -e attrib \
       "${LOCALS[@]}" >/dev/null 2>&1
+    rc=$?
+    # rc 0 = event, 2 = timeout (periodic pass). Anything else is a watcher
+    # failure (e.g. inotify watch limit) — back off instead of hot-looping.
+    if [[ $rc -ne 0 && $rc -ne 2 ]]; then
+      echo "WARNING: inotifywait failed (rc=$rc). If the tree is large, raise the watch limit:"
+      echo "  sudo sysctl fs.inotify.max_user_watches=524288"
+      sleep 60
+    fi
     sleep "$QUIET"
     load_conf
     sync_all
@@ -181,16 +196,35 @@ cmd_add() {
   fi
 
   r="${args[1]:-$ROOT/$(basename "$l")}"
+  r="${r%/}"
+
+  # Guard 4: reserved Drive targets. Syncing onto the gsync root, a machine
+  # root, or the archive would mirror-delete other machines' data.
+  case "$r" in
+    ""|gsync|gsync/.archive|gsync/.archive/*)
+      echo "Refusing: '$r' is a reserved gsync path on Drive."; exit 1 ;;
+  esac
+  if [[ "$r" == "$ROOT" ]]; then
+    echo "Refusing: '$r' is this machine's root; syncing onto it would delete the other synced folders."
+    exit 1
+  fi
+
   mkdir -p "$CONF_DIR"; touch "$CONF"
-  local line f fe
-  while IFS= read -r line; do
-    f="${line%%|*}"
+  local f rem _rest fe
+  while IFS='|' read -r f rem _rest; do
     [[ -z "${f// }" || "$f" == \#* ]] && continue
     fe="${f/#\~/$HOME}"
-    [[ "$fe" == "$l" ]] && { echo "Already watched: $l"; exit 1; }
-    # Guard 3: nested watches sync the same data twice — confusing and wasteful.
-    [[ "$l" == "$fe"/* ]] && { echo "Refusing: $l is inside already-watched $fe."; exit 1; }
-    [[ "$fe" == "$l"/* ]] && { echo "Refusing: $l contains already-watched $fe. Remove it first: gsync remove $fe"; exit 1; }
+    [[ "$fe" == "$l" ]] && { echo "Already synced: $l"; exit 1; }
+    # Guard 3: nested local watches sync the same data twice.
+    [[ "$l" == "$fe"/* ]] && { echo "Refusing: $l is inside already-synced $fe."; exit 1; }
+    [[ "$fe" == "$l"/* ]] && { echo "Refusing: $l contains already-synced $fe. Remove it first: gsync remove $fe"; exit 1; }
+    # Guard 5: Drive-side target collisions — two folders mirroring the same
+    # (or nested) Drive path would delete each other's files on every pass.
+    rem="${rem%/}"
+    [[ -z "$rem" ]] && continue
+    [[ "$rem" == "$r" ]] && { echo "Refusing: Drive target '$r' is already used by $fe."; exit 1; }
+    [[ "$r" == "$rem"/* ]] && { echo "Refusing: Drive target '$r' is inside '$rem' (used by $fe)."; exit 1; }
+    [[ "$rem" == "$r"/* ]] && { echo "Refusing: Drive target '$r' contains '$rem' (used by $fe)."; exit 1; }
   done < "$CONF"
   echo "${l}|${r}|${mode}" >> "$CONF"
   echo "Added ($mode): $l  ->  ${REMOTE}:$r"
@@ -199,6 +233,7 @@ cmd_add() {
 
 cmd_remove() {
   [[ $# -ge 1 ]] || { echo "usage: gsync remove <local_dir>"; exit 1; }
+  [[ -f "$CONF" ]] || { echo "Not in config: $1"; exit 1; }
   local l tmp line f fe found=0
   l="$(realpath -m "$1")"
   tmp="$(mktemp)"
@@ -248,7 +283,7 @@ cmd_status() {
 
 cmd_log() { journalctl --user -u gsync -f; }
 
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
   daemon)     cmd_daemon ;;
