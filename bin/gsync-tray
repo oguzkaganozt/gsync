@@ -163,6 +163,7 @@ class TrayIndicator:
 
         self.state = "idle"
         self.last_ts = 0
+        self._last_sig = None  # (state, status_text, folders) — rebuild only on change
 
         if HAS_AYATANA:
             self._indicator = AppIndicator.Indicator.new(
@@ -310,6 +311,14 @@ class TrayIndicator:
             self.state, self.last_ts = _current_state()
         except Exception:
             self.state = "idle"
+
+        # Only touch the icon/menu when something actually changed —
+        # rebuilding the menu while it is open makes it flicker.
+        folders = tuple(_gsync_list())
+        sig = (self.state, self._status_text(), folders)
+        if sig == self._last_sig:
+            return True
+        self._last_sig = sig
 
         tooltip = "gsync: " + self._status_text()
         if HAS_AYATANA:
