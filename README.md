@@ -1,6 +1,15 @@
 # gsync
 
-Set-and-forget folder sync to Google Drive for Linux — with a system tray icon.
+Set-and-forget Google Drive for Linux — folder backup, Drive browsing, and a
+system tray icon.
+
+Two things in one tool:
+
+1. **Watch & back up** — pick local folders; they sync to Drive the moment
+   they change.
+2. **Browse & edit** — your whole Drive is mounted at `~/GoogleDrive`
+   (also in the Files sidebar as "Google Drive"). Files stream on demand,
+   nothing is downloaded until you open it; edits upload automatically.
 
 Pick folders; gsync watches them with **inotify** and syncs to Google Drive
 with **rclone** the moment something changes (15s quiet window merges rapid
@@ -53,7 +62,9 @@ gsync list                                # what's being watched
 gsync remove ~/Documents                  # stop watching (Drive files kept)
 gsync sync                                # force a pass right now
 gsync pause / gsync resume                # stop / start watching
-gsync status                              # service + last sync state
+gsync mount / unmount                     # mount/unmount Drive at ~/GoogleDrive
+gsync open                                # open ~/GoogleDrive in your file manager
+gsync status                              # service + mount + last sync state
 gsync log                                 # follow live log
 ./uninstall.sh                            # remove (keeps config + remote)
 ```

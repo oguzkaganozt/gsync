@@ -36,6 +36,7 @@ python3 -c "import gi, cairo" 2>/dev/null || APT_PKGS+=(python3-gi python3-gi-ca
 python3 -c "import gi; gi.require_version('AyatanaAppIndicator3','0.1')" 2>/dev/null \
   || APT_PKGS+=(gir1.2-ayatanaappindicator3-0.1)
 command -v notify-send >/dev/null || APT_PKGS+=(libnotify-bin)
+command -v fusermount >/dev/null || command -v fusermount3 >/dev/null || APT_PKGS+=(fuse3)
 if command -v nautilus >/dev/null && ! dpkg -s python3-nautilus >/dev/null 2>&1; then
   APT_PKGS+=(python3-nautilus)
 fi
@@ -47,14 +48,16 @@ fi
 echo "==> Checking rclone remote 'gdrive'"
 if ! rclone listremotes | grep -q '^gdrive:$'; then
   echo "No 'gdrive' remote found. Starting rclone auth (a browser window will open)..."
-  rclone config create gdrive drive scope=drive.file
+  # Full 'drive' scope so the ~/GoogleDrive mount can browse your whole Drive.
+  rclone config create gdrive drive scope=drive
 fi
 
 echo "==> Installing files ($([[ $LOCAL_MODE -eq 1 ]] && echo 'from local repo' || echo 'from GitHub'))"
 fetch "bin/gsync"                  "$HOME/.local/bin/gsync"                            755
 fetch "bin/gsync-tray"             "$HOME/.local/bin/gsync-tray"                       755
-fetch "systemd/gsync.service"      "$HOME/.config/systemd/user/gsync.service"          644
-fetch "systemd/gsync-tray.service" "$HOME/.config/systemd/user/gsync-tray.service"     644
+fetch "systemd/gsync.service"       "$HOME/.config/systemd/user/gsync.service"          644
+fetch "systemd/gsync-tray.service"  "$HOME/.config/systemd/user/gsync-tray.service"     644
+fetch "systemd/gsync-mount.service" "$HOME/.config/systemd/user/gsync-mount.service"    644
 
 # File-manager right-click integration
 if command -v nautilus >/dev/null; then
@@ -98,6 +101,16 @@ echo "==> Enabling services"
 systemctl --user daemon-reload
 systemctl --user enable --now gsync
 systemctl --user try-restart gsync 2>/dev/null || true
+systemctl --user enable --now gsync-mount
+systemctl --user try-restart gsync-mount 2>/dev/null || true
+
+# Nautilus sidebar bookmark for the Drive mount
+BM="$HOME/.config/gtk-3.0/bookmarks"
+mkdir -p "$(dirname "$BM")"; touch "$BM"
+if ! grep -q "file://$HOME/GoogleDrive" "$BM"; then
+  echo "file://$HOME/GoogleDrive Google Drive" >> "$BM"
+  echo "    Files sidebar: 'Google Drive' bookmark added"
+fi
 if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
   systemctl --user enable --now gsync-tray
   systemctl --user try-restart gsync-tray 2>/dev/null || true

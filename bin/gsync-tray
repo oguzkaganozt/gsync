@@ -227,6 +227,13 @@ class TrayIndicator:
         item.connect("activate", lambda *_: self._add_folder())
         menu.append(item)
 
+        item = Gtk.MenuItem(label="Open Google Drive")
+        item.connect("activate", lambda *_: subprocess.Popen(
+            [os.path.expanduser("~/.local/bin/gsync"), "open"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ))
+        menu.append(item)
+
         if self.state == "paused":
             item = Gtk.MenuItem(label="Resume syncing")
             item.connect("activate", lambda *_: self._ctl("start"))
