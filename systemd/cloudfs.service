@@ -1,0 +1,14 @@
+[Unit]
+Description=cloudfs - event-driven folder sync to Google Drive
+Documentation=https://github.com/oguzkaganozt/cloudfs
+After=network-online.target
+
+[Service]
+EnvironmentFile=-%h/.config/cloudfs/environment
+ExecStart=%h/.local/bin/cloudfs daemon
+Restart=on-failure
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=default.target

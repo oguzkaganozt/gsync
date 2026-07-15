@@ -1,8 +1,8 @@
-"""Nautilus extension: top-level right-click menu items for gsync.
+"""Nautilus extension: top-level Google Drive sync actions for cloudfs.
 
 Installed to ~/.local/share/nautilus-python/extensions/ (needs python3-nautilus).
-Shows "Add to gsync" on unwatched folders and "Remove from gsync" on watched
-ones. Right-clicking a file targets the file's parent folder.
+Right-clicking a file targets its parent. Remote mounts are excluded because
+their files already live on Drive or an SSH server.
 """
 import os
 import subprocess
@@ -15,9 +15,25 @@ except ValueError:
     gi.require_version("Nautilus", "3.0")
 from gi.repository import Nautilus, GObject  # noqa: E402
 
-GSYNC = os.path.expanduser("~/.local/bin/gsync")
-CONF = os.path.expanduser("~/.config/gsync/folders.conf")
-MOUNT = os.path.expanduser(os.environ.get("GSYNC_MOUNT", "~/GoogleDrive"))
+CLOUDFS = os.path.expanduser("~/.local/bin/cloudfs")
+CONF_DIR = os.path.expanduser("~/.config/cloudfs")
+CONF = os.path.join(CONF_DIR, "folders.conf")
+SERVERS_CONF = os.path.join(CONF_DIR, "servers.conf")
+
+
+def _drive_mount():
+    value = os.environ.get("CLOUDFS_DRIVE_MOUNT")
+    if not value:
+        try:
+            with open(os.path.join(CONF_DIR, "environment")) as fh:
+                for line in fh:
+                    key, separator, setting = line.strip().partition("=")
+                    if separator and key == "CLOUDFS_DRIVE_MOUNT":
+                        value = setting.strip("\"'")
+        except OSError:
+            pass
+    value = os.path.expandvars(value or "~/GoogleDrive")
+    return os.path.realpath(os.path.expanduser(value))
 
 
 def _watched_dirs():
@@ -38,7 +54,7 @@ def _watched_dirs():
 def _notify(msg):
     try:
         subprocess.Popen(
-            ["notify-send", "--app-name=gsync", "gsync", msg],
+            ["notify-send", "--app-name=cloudfs", "cloudfs", msg],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     except OSError:
@@ -50,22 +66,41 @@ def _path_of(file_info):
     return loc.get_path() if loc else None
 
 
+def _remote_mounts():
+    mounts = [_drive_mount()]
+    try:
+        with open(SERVERS_CONF) as fh:
+            for line in fh:
+                alias = line.strip()
+                if alias and not alias.startswith("#"):
+                    mounts.append(os.path.realpath(
+                        os.path.join(os.path.expanduser("~"), alias)
+                    ))
+    except OSError:
+        pass
+    return mounts
+
+
+def _is_remote_path(path):
+    return any(path == mount or path.startswith(mount + os.sep)
+               for mount in _remote_mounts())
+
+
 def _target_dir(file_info):
     p = _path_of(file_info)
     if p is None:
         return None
     p = p if os.path.isdir(p) else os.path.dirname(p)
-    # Paths on the Drive mount are already on Drive — offer no menu there.
-    if p == MOUNT or p.startswith(MOUNT + os.sep):
+    if _is_remote_path(p):
         return None
     return p
 
 
-class GsyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
+class CloudfsMenuProvider(GObject.GObject, Nautilus.MenuProvider):
     def _run(self, verb, paths):
         msgs = []
         for p in paths:
-            r = subprocess.run([GSYNC, verb, p], capture_output=True, text=True)
+            r = subprocess.run([CLOUDFS, verb, p], capture_output=True, text=True)
             msgs.append((r.stdout or r.stderr or "done").strip())
         _notify("\n".join(msgs))
 
@@ -76,7 +111,7 @@ class GsyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
         items = []
         if add_paths:
             it = Nautilus.MenuItem(
-                name="GsyncMenuProvider::add",
+                name="CloudfsMenuProvider::add",
                 label="Sync to Google Drive",
                 tip="Keep this folder continuously synced to Google Drive",
             )
@@ -84,7 +119,7 @@ class GsyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
             items.append(it)
         if rm_paths:
             it = Nautilus.MenuItem(
-                name="GsyncMenuProvider::remove",
+                name="CloudfsMenuProvider::remove",
                 label="Stop syncing this folder",
                 tip="Stop syncing (files already on Drive are kept)",
             )
@@ -103,7 +138,7 @@ class GsyncMenuProvider(GObject.GObject, Nautilus.MenuProvider):
     # Right-click on empty space inside an open folder.
     def get_background_items(self, *args):
         folder = args[-1]
-        p = _path_of(folder)
+        p = _target_dir(folder)
         if not p or not os.path.isdir(p):
             return []
         return self._make_items({p})

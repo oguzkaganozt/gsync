@@ -1,0 +1,15 @@
+[Unit]
+Description=cloudfs system tray indicator
+Documentation=https://github.com/oguzkaganozt/cloudfs
+PartOf=graphical-session.target
+After=graphical-session.target cloudfs.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cloudfs-tray
+Restart=on-failure
+RestartSec=3
+Environment=XDG_RUNTIME_DIR=%t
+
+[Install]
+WantedBy=graphical-session.target

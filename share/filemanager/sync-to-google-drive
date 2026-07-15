@@ -1,10 +1,10 @@
 #!/bin/bash
-# gsync file-manager context menu script (Nemo "Scripts" mechanism).
+# cloudfs file-manager context menu script (Nemo "Scripts" mechanism).
 # Installed as "Sync to Google Drive" — right-click a folder to start syncing it.
-# Right-clicking a file targets the file's parent folder (gsync syncs folders).
+# Right-clicking a file targets the file's parent folder (cloudfs syncs folders).
 
 notify() {
-  command -v notify-send >/dev/null && notify-send --app-name=gsync "gsync" "$1"
+  command -v notify-send >/dev/null && notify-send --app-name=cloudfs "cloudfs" "$1"
 }
 
 PATHS="${NAUTILUS_SCRIPT_SELECTED_FILE_PATHS:-${NEMO_SCRIPT_SELECTED_FILE_PATHS:-}}"
@@ -17,7 +17,7 @@ while IFS= read -r p; do
     p="$(dirname "$p")"
     msgs+=("(file selected — syncing its folder instead)")
   fi
-  out="$("$HOME/.local/bin/gsync" add "$p" 2>&1)"
+  out="$("$HOME/.local/bin/cloudfs" add "$p" 2>&1)"
   msgs+=("$out")
 done <<< "$PATHS"
 

@@ -1,0 +1,19 @@
+[Unit]
+Description=cloudfs mount for %i
+Documentation=https://github.com/oguzkaganozt/cloudfs
+After=network-online.target
+
+[Service]
+Type=notify
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-%h/.config/cloudfs/environment
+ExecStart=%h/.local/bin/cloudfs _mount %i
+ExecStopPost=%h/.local/bin/cloudfs _unmount %i
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=60
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

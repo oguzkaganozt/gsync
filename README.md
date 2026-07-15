@@ -1,108 +1,172 @@
-# gsync
+# cloudfs
 
-Set-and-forget Google Drive for Linux — folder backup, Drive browsing, and a
-system tray icon.
+One Linux desktop tool for Google Drive sync and direct access to remote files.
 
-Two things in one tool:
+cloudfs provides two deliberately separate capabilities:
 
-1. **Sync** — pick local folders; they mirror to Drive the moment they change.
-2. **Browse & edit** — your whole Drive is mounted at `~/GoogleDrive`
-   (also in the Files sidebar as "Google Drive"). Files stream on demand,
-   nothing is downloaded until you open it; edits upload automatically.
+1. **Google Drive** - browse the whole Drive at `~/GoogleDrive`, and keep
+   selected local folders synced to Drive.
+2. **SSH servers** - browse a registered server's home directory at
+   `~/<ssh-alias>` without downloading a full offline copy.
 
-**How to think about it — one question:** *where should this live?*
+Both kinds of remote storage appear in the Files (Nautilus) sidebar and are
+managed from one tray icon. User-level systemd services start them at login
+and recover from transient failures.
 
-- "It should just be in the cloud, reachable anywhere" → put it in
-  `~/GoogleDrive`. Done, no setup.
-- "It must live on my disk (code, projects, tool-heavy folders) but must
-  survive disk death" → right-click → **Sync to Google Drive**.
+## How it works
 
-Pick folders; gsync watches them with **inotify** and syncs to Google Drive
-with **rclone** the moment something changes (15s quiet window merges rapid
-saves into one pass). A cloud icon in your tray shows what's happening:
+- Google Drive access uses `rclone mount` and streams files on demand.
+- Folder sync uses `rclone sync` or `rclone bisync`, triggered by `inotify`.
+- Server access uses rclone's SFTP backend through the system OpenSSH client.
+  Host, user, port, key, `ProxyJump`, and host-key rules come from
+  `~/.ssh/config`.
+- Mounts use isolated `cloudfs-mount@.service` instances, so one unavailable
+  remote does not stop the others.
 
-| Icon | Meaning |
-|---|---|
-| grey cloud | idle, watching |
-| bright cloud + arrow | syncing right now |
-| amber cloud + `!` | last sync had errors |
-| slashed cloud | paused |
-
-Left-click the icon to sync now; right-click for the menu (sync now,
-add folder via a folder picker, pause/resume, view log, watched-folder list).
-Everything starts automatically at login and recovers on failure
-(systemd user services).
-
-File-manager integration: in GNOME Files (Nautilus), right-click any folder →
-**Sync to Google Drive** (top-level menu item; synced folders show **Stop
-syncing this folder** instead; the menu is hidden inside `~/GoogleDrive`,
-where syncing makes no sense). Right-clicking a file targets the file's
-folder. Works on the open folder's empty space too. Nemo users get the same
-via **Scripts → Sync to Google Drive**.
-
-## Safety net
-
-Sync mirrors your disk — so a local mistake would normally mirror too.
-To make mistakes recoverable, anything deleted or overwritten on the Drive
-side is parked (server-side move, instant) under a dated archive:
-
-```
-gsync/.archive/<hostname>/<YYYY-MM-DD>/<original path>
-```
-
-Archives older than 30 days are cleaned up automatically
-(`GSYNC_ARCHIVE_DAYS` to change). Drive's own trash and file versions add a
-second layer. Note: the archive applies to **oneway** folders; twoway
-(bisync) folders rely on Drive trash and rclone's conflict copies.
-
-Guards you don't have to think about: gsync refuses to sync paths inside
-`~/GoogleDrive` (already on Drive), paths that *contain* the mount (would
-recursively pull your whole Drive), and nested/overlapping synced folders.
-
-Two modes, per folder:
-
-- **oneway** (default) — mirrors local → Drive. Backup semantics: your disk
-  is the source of truth. No conflicts, ever.
-- **twoway** — `rclone bisync`; Drive-side changes flow back too (picked up
-  every ~5 min). Concurrent edits on both sides become conflict copies, not
-  overwrites.
+Server access is a live mount, not an offline mirror. If the server or network
+is unavailable, its files are unavailable. Syncthing is a better fit when a
+complete offline copy of a selected directory is required.
 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oguzkaganozt/gsync/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/oguzkaganozt/cloudfs/master/install.sh | bash
 ```
 
-The installer checks deps (`rclone` required; installs `inotify-tools` and
-tray libs via apt if missing), creates the `gdrive` rclone remote if you
-don't have one (browser OAuth, narrow `drive.file` scope), installs the
-daemon + tray as systemd user services, and migrates config from the old
-`gdrive-autosync` name if found.
+The installer:
 
-## CLI
+- checks for rclone and installs missing desktop/FUSE dependencies with apt;
+- creates the `gdrive` rclone remote through browser OAuth when needed;
+- installs the CLI, tray, systemd units, and file-manager integration;
+- mounts Google Drive at `~/GoogleDrive`;
+- adds Google Drive to the Files sidebar.
+
+The Google Drive OAuth uses full Drive scope because browsing the whole Drive
+requires access to files not created by cloudfs.
+
+## Google Drive
+
+Put cloud-only files directly under `~/GoogleDrive`. Files stream on demand;
+edits are uploaded through rclone's write cache.
+
+For local folders that must remain on disk and survive disk loss:
 
 ```bash
-gsync add ~/Documents                     # watch (oneway, -> gsync/<hostname>/Documents)
-gsync add ~/notes shared/notes --two-way  # custom Drive path, bidirectional
-gsync list                                # what's being watched
-gsync remove ~/Documents                  # stop watching (Drive files kept)
-gsync sync                                # force a pass right now
-gsync pause / gsync resume                # stop / start watching
-gsync mount / unmount                     # mount/unmount Drive at ~/GoogleDrive
-gsync open                                # open ~/GoogleDrive in your file manager
-gsync status                              # service + mount + last sync state
-gsync log                                 # follow live log
-./uninstall.sh                            # remove (keeps config + remote)
+cloudfs add ~/Documents
+cloudfs add ~/notes shared/notes --two-way
+cloudfs list
+cloudfs remove ~/Documents
+cloudfs sync
+cloudfs mount
+cloudfs unmount
+cloudfs open
 ```
 
-Config lives at `~/.config/gsync/folders.conf`
-(format: `LOCAL|DRIVE_PATH|MODE`); editing it by hand works too.
+The default one-way mode treats the local disk as the source of truth.
+Two-way mode uses `rclone bisync`; concurrent edits become conflict copies.
 
-Default excludes: `node_modules`, `.cache`, `__pycache__`, `.venv`,
-`target`, `build`, `*.tmp`, `*.swp`.
+For one-way folders, deleted or overwritten Drive files are parked under:
 
-Environment overrides: `GSYNC_REMOTE` (default `gdrive`),
-`GSYNC_QUIET_SECONDS` (default `15`), `GSYNC_ROOT` (default
-`gsync/<hostname>` — per-machine Drive root, so several machines can run
-gsync against the same account without colliding; use an explicit custom
-path when you *want* machines to share one folder).
+```text
+cloudfs/.archive/<hostname>/<YYYY-MM-DD>/<original-path>
+```
+
+Archives older than 30 days are cleaned automatically. Drive trash and file
+versions provide an additional safety layer.
+
+cloudfs refuses nested sync roots and paths that contain or live inside any
+cloudfs mount. This prevents duplicate watches and remote-to-remote loops.
+
+## SSH servers
+
+First create and test a normal OpenSSH alias:
+
+```sshconfig
+Host vps
+    HostName vps.example.com
+    User deploy
+    IdentityFile ~/.ssh/id_ed25519
+```
+
+```bash
+ssh vps
+cloudfs server add vps
+```
+
+`cloudfs server add` explicitly registers the alias, enables its mount at
+login, mounts the remote user's home directory at `~/vps`, and adds it to the
+Files sidebar. cloudfs never scans or mounts every entry in `~/.ssh/config`.
+
+Server commands:
+
+```bash
+cloudfs server list
+cloudfs server open vps
+cloudfs server unmount vps
+cloudfs server mount vps
+cloudfs server remove vps
+```
+
+Mount services are noninteractive. Password-protected keys must already be
+available through `ssh-agent`, and the host key should be accepted by running
+`ssh <alias>` once before adding the server.
+
+Removing a server only removes its cloudfs registration, mount, service
+instance, and sidebar bookmark. Remote files and `~/.ssh/config` are untouched.
+
+## Tray and file manager
+
+The tray icon shows Drive sync state and reports a failed server mount as an
+error. Its menu provides:
+
+- watched Drive folders and manual sync;
+- Google Drive access;
+- registered server mount/open/unmount/remove actions;
+- an SSH server alias entry dialog;
+- sync pause/resume and logs.
+
+In Nautilus, right-click a local folder and choose **Sync to Google Drive**.
+The action is hidden inside Google Drive and registered server mounts. Nemo
+users receive the same add action under **Scripts**.
+
+## Configuration
+
+```text
+~/.config/cloudfs/folders.conf   Google Drive sync folders
+~/.config/cloudfs/servers.conf   explicitly registered SSH aliases
+~/.config/cloudfs/environment    settings loaded by CLI and systemd services
+~/.local/state/cloudfs/          sync state and bisync markers
+```
+
+Environment overrides:
+
+- `CLOUDFS_REMOTE` - rclone Drive remote, default `gdrive`
+- `CLOUDFS_ROOT` - default Drive sync root, default `cloudfs/<hostname>`
+- `CLOUDFS_DRIVE_MOUNT` - Drive mountpoint, default `~/GoogleDrive`
+- `CLOUDFS_QUIET_SECONDS` - local change debounce, default `15`
+- `CLOUDFS_ARCHIVE_DAYS` - archive retention, default `30`
+
+Edit `~/.config/cloudfs/environment` to change these persistently, then run
+`systemctl --user daemon-reload` and restart the relevant cloudfs services.
+
+Default sync excludes include `node_modules`, `.cache`, `__pycache__`,
+`.venv`, `target`, `build`, `*.tmp`, and `*.swp`.
+
+## Service control
+
+```bash
+cloudfs pause
+cloudfs resume
+cloudfs status
+cloudfs log
+```
+
+To uninstall from a clone:
+
+```bash
+./uninstall.sh
+```
+
+Uninstall stops all mounts and removes installed cloudfs files. It preserves
+cloudfs configuration/state, SSH configuration, rclone remotes, and all remote
+files.

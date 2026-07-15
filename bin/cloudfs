@@ -1,0 +1,645 @@
+#!/bin/bash
+# cloudfs — Google Drive sync plus on-demand Google Drive and SFTP mounts.
+#
+#   cloudfs add <dir> [drive_path] [--two-way]   watch a folder
+#   cloudfs remove <dir>                         stop watching a folder
+#   cloudfs list / sync                          list folders / sync now
+#   cloudfs mount / unmount / open               manage Google Drive
+#   cloudfs server add <ssh_alias>               add and mount an SSH server
+#   cloudfs server list                          list registered servers
+#   cloudfs server mount|unmount|open <alias>    manage a server mount
+#   cloudfs server remove <alias>                remove a server mount
+#   cloudfs pause / resume / status / log        manage the sync daemon
+#
+# Modes: oneway (default) mirrors local -> Drive (disk is the source of truth).
+#        twoway uses rclone bisync; remote changes flow back too.
+set -u
+
+CONF_DIR="$HOME/.config/cloudfs"
+CONF="$CONF_DIR/folders.conf"
+SERVERS_CONF="$CONF_DIR/servers.conf"
+ENV_FILE="$CONF_DIR/environment"
+if [[ -f "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+fi
+STATE_DIR="$HOME/.local/state/cloudfs"
+STATUS_FILE="$STATE_DIR/status"
+REMOTE="${CLOUDFS_REMOTE:-gdrive}"
+QUIET="${CLOUDFS_QUIET_SECONDS:-15}"
+ROOT="${CLOUDFS_ROOT:-cloudfs/$(hostname)}"
+DRIVE_MOUNT="${CLOUDFS_DRIVE_MOUNT:-$HOME/GoogleDrive}"
+[[ "$DRIVE_MOUNT" != /* ]] || DRIVE_MOUNT="$(realpath -m "$DRIVE_MOUNT")"
+ARCHIVE="cloudfs/.archive/$(hostname)"
+ARCHIVE_KEEP_DAYS="${CLOUDFS_ARCHIVE_DAYS:-30}"
+
+EXCLUDES=(
+  --exclude 'node_modules/**'
+  --exclude '.cache/**'
+  --exclude '__pycache__/**'
+  --exclude '.venv/**'
+  --exclude 'target/**'
+  --exclude 'build/**'
+  --exclude '*.tmp'
+  --exclude '*.swp'
+)
+
+declare -a LOCALS REMOTES MODES
+FAILED=0
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+validate_server_alias() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+    || die "Invalid server alias '$1'. Use letters, numbers, dots, underscores, or dashes."
+  [[ "$1" != "gdrive" && "$1" != "GoogleDrive" ]] \
+    || die "'$1' is reserved for the Google Drive mount."
+}
+
+server_registered() {
+  [[ -f "$SERVERS_CONF" ]] && grep -Fxq "$1" "$SERVERS_CONF"
+}
+
+server_mountpoint() { realpath -m "$HOME/$1"; }
+mount_unit() { printf 'cloudfs-mount@%s.service\n' "$1"; }
+
+mount_state() {
+  local unit="$1" values key value active="" sub="" result=""
+  values="$(systemctl --user show "$unit" \
+    --property=ActiveState --property=SubState --property=Result 2>/dev/null)" || {
+      echo "unmounted"
+      return
+    }
+  while IFS='=' read -r key value; do
+    case "$key" in
+      ActiveState) active="$value" ;;
+      SubState) sub="$value" ;;
+      Result) result="$value" ;;
+    esac
+  done <<< "$values"
+  if [[ "$active" == "active" ]]; then
+    echo "mounted"
+  elif [[ "$active" == "activating" || "$sub" == "auto-restart" ]]; then
+    echo "retrying"
+  elif [[ "$active" == "inactive" ]]; then
+    echo "unmounted"
+  elif [[ "$active" == "failed" || ( -n "$result" && "$result" != "success" ) ]]; then
+    echo "failed"
+  else
+    echo "unmounted"
+  fi
+}
+
+bookmark_add() {
+  local path="$1" label="$2" bm="$HOME/.config/gtk-3.0/bookmarks"
+  mkdir -p "$(dirname "$bm")"; touch "$bm"
+  grep -Fq "file://$path " "$bm" || printf 'file://%s %s\n' "$path" "$label" >> "$bm"
+}
+
+bookmark_remove() {
+  local path="$1" bm="$HOME/.config/gtk-3.0/bookmarks" tmp line
+  [[ -f "$bm" ]] || return 0
+  tmp="$(mktemp)"
+  while IFS= read -r line; do
+    [[ "$line" == "file://$path" || "$line" == "file://$path "* ]] || printf '%s\n' "$line"
+  done < "$bm" > "$tmp"
+  mv "$tmp" "$bm"
+}
+
+registered_server_mounts() {
+  local alias
+  [[ -f "$SERVERS_CONF" ]] || return 0
+  while IFS= read -r alias; do
+    [[ -n "$alias" && "$alias" != \#* ]] && server_mountpoint "$alias"
+  done < "$SERVERS_CONF"
+}
+
+reject_mount_overlap() {
+  local local_path="$1" mount_path
+  while IFS= read -r mount_path; do
+    [[ -n "$mount_path" ]] || continue
+    if [[ "$local_path" == "$mount_path" || "$local_path" == "$mount_path"/* ]]; then
+      die "This folder is already on remote storage ($mount_path); no Drive sync is needed."
+    fi
+    if [[ "$mount_path" == "$local_path"/* ]]; then
+      die "$local_path contains a cloudfs mount ($mount_path); syncing it would create a transfer loop."
+    fi
+  done < <(printf '%s\n' "$DRIVE_MOUNT"; registered_server_mounts)
+}
+
+reject_sync_overlap() {
+  local mount_path="$1" configured _remote _mode configured_path
+  [[ -f "$CONF" ]] || return 0
+  while IFS='|' read -r configured _remote _mode; do
+    [[ -n "${configured// /}" && "$configured" != \#* ]] || continue
+    configured_path="$(realpath -m "${configured/#\~/$HOME}")"
+    if [[ "$configured_path" == "$mount_path" || "$configured_path" == "$mount_path"/* \
+      || "$mount_path" == "$configured_path"/* ]]; then
+      die "Server mount $mount_path overlaps synced folder $configured_path. Remove the sync first."
+    fi
+  done < "$CONF"
+}
+
+validate_drive_target() {
+  local target="$1" segment
+  local -a target_segments
+  [[ -n "$target" ]] || die "Drive target cannot be empty."
+  [[ "$target" != /* ]] || die "Drive target must be relative (no leading slash): $target"
+  [[ "$target" != *//* ]] || die "Drive target cannot contain repeated slashes: $target"
+  [[ "$target" != *'|'* && "$target" != *$'\n'* && "$target" != *$'\r'* ]] \
+    || die "Drive target contains an unsupported character."
+  IFS='/' read -r -a target_segments <<< "$target"
+  for segment in "${target_segments[@]}"; do
+    [[ "$segment" != "." && "$segment" != ".." ]] \
+      || die "Drive target cannot contain '.' or '..' path segments: $target"
+  done
+  case "$target" in
+    cloudfs|cloudfs/.archive|cloudfs/.archive/*)
+      die "'$target' is a reserved cloudfs path on Drive." ;;
+  esac
+  [[ "$target" != "$ROOT" ]] \
+    || die "'$target' is this machine's Drive root; syncing onto it could delete sibling folders."
+}
+
+import_ssh_agent() {
+  if [[ -n "${SSH_AUTH_SOCK:-}" && -S "$SSH_AUTH_SOCK" ]]; then
+    systemctl --user set-environment "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" 2>/dev/null || true
+  fi
+}
+
+set_status() { # syncing | idle | error
+  mkdir -p "$STATE_DIR"
+  printf '%s|%s\n' "$1" "$(date +%s)" > "$STATUS_FILE"
+}
+
+load_conf() {
+  LOCALS=(); REMOTES=(); MODES=()
+  [[ -f "$CONF" ]] || return 0
+  local l r m extra i existing_local existing_remote
+  local -a seen_locals=() seen_remotes=()
+  while IFS='|' read -r l r m extra; do
+    [[ -z "${l// /}" || "$l" == \#* ]] && continue
+    [[ -z "${extra:-}" ]] || die "Invalid folders.conf entry (too many fields): $l"
+    [[ "$l" != *$'\n'* && "$l" != *$'\r'* ]] || die "Invalid local path in folders.conf."
+    l="$(realpath -m "${l/#\~/$HOME}")"
+    r="${r%/}"
+    m="${m:-oneway}"
+    validate_drive_target "$r"
+    [[ "$m" == "oneway" || "$m" == "twoway" ]] \
+      || die "Invalid sync mode '$m' for $l; expected oneway or twoway."
+    for i in "${!seen_locals[@]}"; do
+      existing_local="${seen_locals[$i]}"
+      existing_remote="${seen_remotes[$i]}"
+      [[ "$l" != "$existing_local" && "$l" != "$existing_local"/* && "$existing_local" != "$l"/* ]] \
+        || die "Overlapping local sync roots in folders.conf: $l and $existing_local"
+      [[ "$r" != "$existing_remote" && "$r" != "$existing_remote"/* && "$existing_remote" != "$r"/* ]] \
+        || die "Overlapping Drive targets in folders.conf: $r and $existing_remote"
+    done
+    seen_locals+=("$l")
+    seen_remotes+=("$r")
+    if [[ ! -d "$l" ]]; then
+      echo "SKIPPED (no such directory): $l"
+      continue
+    fi
+    LOCALS+=("$l"); REMOTES+=("$r"); MODES+=("$m")
+  done < "$CONF"
+}
+
+sync_one() {
+  local l="$1" r="$2" m="$3"
+  if [[ "$m" == "twoway" ]]; then
+    mkdir -p "$STATE_DIR"
+    local marker
+    marker="$STATE_DIR/$(printf '%s' "$l" | md5sum | awk '{print $1}').resynced"
+    if [[ ! -f "$marker" ]]; then
+      echo "bisync (first run, --resync): $l <-> ${REMOTE}:$r"
+      if rclone bisync "$l" "${REMOTE}:$r" --resync "${EXCLUDES[@]}"; then
+        touch "$marker"
+      else
+        echo "ERROR: initial bisync failed: $l"
+        FAILED=1
+      fi
+    else
+      echo "bisync: $l <-> ${REMOTE}:$r"
+      rclone bisync "$l" "${REMOTE}:$r" "${EXCLUDES[@]}" \
+        || { echo "ERROR: bisync failed: $l  (to force recovery: rm $marker)"; FAILED=1; }
+    fi
+  else
+    echo "sync: $l -> ${REMOTE}:$r"
+    # --backup-dir: anything deleted/overwritten is parked under a dated
+    # archive folder instead of vanishing (server-side move, cheap).
+    rclone sync "$l" "${REMOTE}:$r" "${EXCLUDES[@]}" \
+      --backup-dir "${REMOTE}:${ARCHIVE}/$(date +%F)/$r" \
+      || { echo "ERROR: sync failed: $l"; FAILED=1; }
+  fi
+}
+
+cleanup_archive() {
+  # Once a day, drop archive date-folders older than ARCHIVE_KEEP_DAYS.
+  # Keyed on the folder NAME (= archive date), not file mtimes — rclone's
+  # --min-age would look at original file mtimes and delete fresh archives.
+  local stamp="$STATE_DIR/last-archive-cleanup" now last=0
+  now=$(date +%s)
+  [[ -f "$stamp" ]] && last=$(cat "$stamp" 2>/dev/null || echo 0)
+  (( now - last < 86400 )) && return 0
+  mkdir -p "$STATE_DIR"; echo "$now" > "$stamp"
+  local cutoff d
+  cutoff=$(date -d "$ARCHIVE_KEEP_DAYS days ago" +%F)
+  rclone lsf "${REMOTE}:${ARCHIVE}" --dirs-only 2>/dev/null | while IFS= read -r d; do
+    d="${d%/}"
+    [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+    if [[ "$d" < "$cutoff" ]]; then
+      echo "archive cleanup: removing ${ARCHIVE}/$d"
+      rclone purge "${REMOTE}:${ARCHIVE}/$d" 2>/dev/null || true
+    fi
+  done
+}
+
+sync_all() {
+  mkdir -p "$STATE_DIR"
+  local lock_fd
+  exec {lock_fd}>"$STATE_DIR/sync.lock"
+  if ! flock -n "$lock_fd"; then
+    echo "A sync pass is already running."
+    eval "exec ${lock_fd}>&-"
+    return 0
+  fi
+  FAILED=0
+  set_status syncing
+  local i
+  for i in "${!LOCALS[@]}"; do
+    sync_one "${LOCALS[$i]}" "${REMOTES[$i]}" "${MODES[$i]}"
+  done
+  if [[ "$FAILED" -eq 0 ]]; then
+    set_status idle
+  else
+    set_status error
+  fi
+  flock -u "$lock_fd"
+  eval "exec ${lock_fd}>&-"
+}
+
+poll_interval() {
+  # twoway folders need polling to pick up remote-side changes
+  local i
+  for i in "${!MODES[@]}"; do
+    [[ "${MODES[$i]}" == "twoway" ]] && { echo 300; return; }
+  done
+  echo 3600
+}
+
+restart_service() {
+  if systemctl --user is-active -q cloudfs 2>/dev/null; then
+    systemctl --user restart cloudfs && echo "Service restarted."
+  fi
+}
+
+cmd_daemon() {
+  load_conf
+  # No folders yet is not an error: wait for config instead of crash-looping
+  # under systemd's Restart=on-failure.
+  if [[ ${#LOCALS[@]} -eq 0 ]]; then
+    echo "No folders configured yet — waiting. Add one with: cloudfs add <dir>"
+    set_status idle
+    while [[ ${#LOCALS[@]} -eq 0 ]]; do
+      sleep 60
+      load_conf
+    done
+    echo "Configuration found (${#LOCALS[@]} folder(s))."
+  fi
+  echo "Initial sync (${#LOCALS[@]} folder(s))..."
+  sync_all
+  cleanup_archive
+  echo "Watching: ${LOCALS[*]}"
+  local rc
+  while :; do
+    inotifywait -r -q -t "$(poll_interval)" \
+      -e create -e modify -e delete -e move -e attrib \
+      "${LOCALS[@]}" >/dev/null 2>&1
+    rc=$?
+    # rc 0 = event, 2 = timeout (periodic pass). Anything else is a watcher
+    # failure (e.g. inotify watch limit) — back off instead of hot-looping.
+    if [[ $rc -ne 0 && $rc -ne 2 ]]; then
+      echo "WARNING: inotifywait failed (rc=$rc). If the tree is large, raise the watch limit:"
+      echo "  sudo sysctl fs.inotify.max_user_watches=524288"
+      sleep 60
+    fi
+    sleep "$QUIET"
+    load_conf
+    sync_all
+    cleanup_archive
+  done
+}
+
+cmd_add() {
+  local mode=oneway args=() a
+  for a in "$@"; do
+    case "$a" in --two-way|--twoway) mode=twoway ;; *) args+=("$a") ;; esac
+  done
+  if [[ ${#args[@]} -lt 1 ]]; then
+    echo "usage: cloudfs add <local_dir> [drive_path] [--two-way]"
+    exit 1
+  fi
+  local l r
+  l="$(realpath -m "${args[0]}")"
+  [[ -d "$l" ]] || { echo "No such directory: $l"; exit 1; }
+  [[ "$l" != *'|'* && "$l" != *$'\n'* && "$l" != *$'\r'* ]] \
+    || die "Local path contains a character unsupported by folders.conf."
+
+  reject_mount_overlap "$l"
+
+  r="${args[1]:-$ROOT/$(basename "$l")}"
+  r="${r%/}"
+  validate_drive_target "$r"
+
+  # Fail closed if folders.conf was edited into an unsafe state.
+  load_conf
+
+  mkdir -p "$CONF_DIR"; touch "$CONF"
+  local f rem _rest fe
+  while IFS='|' read -r f rem _rest; do
+    [[ -z "${f// }" || "$f" == \#* ]] && continue
+    fe="${f/#\~/$HOME}"
+    [[ "$fe" == "$l" ]] && { echo "Already synced: $l"; exit 1; }
+    # Guard 3: nested local watches sync the same data twice.
+    [[ "$l" == "$fe"/* ]] && { echo "Refusing: $l is inside already-synced $fe."; exit 1; }
+    [[ "$fe" == "$l"/* ]] && { echo "Refusing: $l contains already-synced $fe. Remove it first: cloudfs remove $fe"; exit 1; }
+    # Guard 5: Drive-side target collisions — two folders mirroring the same
+    # (or nested) Drive path would delete each other's files on every pass.
+    rem="${rem%/}"
+    [[ -z "$rem" ]] && continue
+    [[ "$rem" == "$r" ]] && { echo "Refusing: Drive target '$r' is already used by $fe."; exit 1; }
+    [[ "$r" == "$rem"/* ]] && { echo "Refusing: Drive target '$r' is inside '$rem' (used by $fe)."; exit 1; }
+    [[ "$rem" == "$r"/* ]] && { echo "Refusing: Drive target '$r' contains '$rem' (used by $fe)."; exit 1; }
+  done < "$CONF"
+  echo "${l}|${r}|${mode}" >> "$CONF"
+  echo "Added ($mode): $l  ->  ${REMOTE}:$r"
+  restart_service
+}
+
+cmd_remove() {
+  [[ $# -ge 1 ]] || { echo "usage: cloudfs remove <local_dir>"; exit 1; }
+  [[ -f "$CONF" ]] || { echo "Not in config: $1"; exit 1; }
+  local l tmp line f fe found=0
+  l="$(realpath -m "$1")"
+  tmp="$(mktemp)"
+  while IFS= read -r line; do
+    f="${line%%|*}"; fe="${f/#\~/$HOME}"
+    if [[ "$fe" == "$l" ]]; then found=1; continue; fi
+    printf '%s\n' "$line"
+  done < "$CONF" > "$tmp"
+  mv "$tmp" "$CONF"
+  if [[ "$found" -eq 1 ]]; then
+    echo "Removed: $l (files already on Drive are kept)"
+    restart_service
+  else
+    echo "Not in config: $l"
+  fi
+}
+
+cmd_list() {
+  load_conf
+  if [[ ${#LOCALS[@]} -eq 0 ]]; then echo "No folders configured."; return; fi
+  local i
+  for i in "${!LOCALS[@]}"; do
+    printf '%-8s %s  ->  %s:%s\n' "[${MODES[$i]}]" "${LOCALS[$i]}" "$REMOTE" "${REMOTES[$i]}"
+  done
+}
+
+cmd_sync() {
+  load_conf
+  [[ ${#LOCALS[@]} -eq 0 ]] && { echo "No folders configured."; exit 1; }
+  sync_all
+  [[ "$FAILED" -eq 0 ]]
+}
+
+cmd_server_add() {
+  [[ $# -eq 1 ]] || die "usage: cloudfs server add <ssh_alias>"
+  local alias="$1" mountpoint unit
+  validate_server_alias "$alias"
+  server_registered "$alias" && die "Server '$alias' is already registered."
+  command -v ssh >/dev/null || die "OpenSSH client is not installed."
+  ssh -G "$alias" >/dev/null 2>&1 || die "OpenSSH could not resolve '$alias'. Check ~/.ssh/config."
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$alias" true; then
+    die "Noninteractive SSH login failed. Run 'ssh $alias' first and ensure its key is available."
+  fi
+
+  mountpoint="$(server_mountpoint "$alias")"
+  if [[ "$mountpoint" == "$DRIVE_MOUNT" || "$mountpoint" == "$DRIVE_MOUNT"/* \
+    || "$DRIVE_MOUNT" == "$mountpoint"/* ]]; then
+    die "Server mount $mountpoint overlaps the Google Drive mount $DRIVE_MOUNT."
+  fi
+  reject_sync_overlap "$mountpoint"
+  [[ ! -L "$mountpoint" ]] || die "Refusing to mount over symlink: $mountpoint"
+  if [[ -d "$mountpoint" && -n "$(ls -A "$mountpoint" 2>/dev/null)" ]]; then
+    die "Refusing to mount over non-empty directory: $mountpoint"
+  fi
+  [[ ! -e "$mountpoint" || -d "$mountpoint" ]] || die "Mountpoint is not a directory: $mountpoint"
+
+  mkdir -p "$CONF_DIR" "$mountpoint"
+  touch "$SERVERS_CONF"
+  printf '%s\n' "$alias" >> "$SERVERS_CONF"
+  bookmark_add "$mountpoint" "$alias"
+
+  unit="$(mount_unit "$alias")"
+  import_ssh_agent
+  if systemctl --user enable --now "$unit"; then
+    echo "Added '$alias': $mountpoint"
+  else
+    echo "Server '$alias' was registered, but the mount failed." >&2
+    echo "Verify 'ssh $alias', then run: cloudfs server mount $alias" >&2
+    return 1
+  fi
+}
+
+cmd_server_list() {
+  local plain=0 alias state mountpoint unit count=0
+  [[ "${1:-}" == "--plain" ]] && plain=1
+  if [[ ! -s "$SERVERS_CONF" ]]; then
+    [[ "$plain" -eq 1 ]] || echo "No servers configured."
+    return 0
+  fi
+  while IFS= read -r alias; do
+    [[ -n "$alias" && "$alias" != \#* ]] || continue
+    count=$((count + 1))
+    unit="$(mount_unit "$alias")"
+    state="$(mount_state "$unit")"
+    mountpoint="$(server_mountpoint "$alias")"
+    if [[ "$plain" -eq 1 ]]; then
+      printf '%s|%s|%s\n' "$alias" "$state" "$mountpoint"
+    else
+      printf '%-20s %-10s %s\n' "$alias" "$state" "$mountpoint"
+    fi
+  done < "$SERVERS_CONF"
+  [[ "$count" -gt 0 || "$plain" -eq 1 ]] || echo "No servers configured."
+}
+
+require_server() {
+  [[ $# -eq 1 ]] || die "A server alias is required."
+  validate_server_alias "$1"
+  server_registered "$1" || die "Unknown server '$1'. Add it first: cloudfs server add $1"
+}
+
+cmd_server_mount() {
+  require_server "$@"
+  import_ssh_agent
+  systemctl --user start "$(mount_unit "$1")" || die "Could not mount '$1'. Check: journalctl --user -u $(mount_unit "$1")"
+  echo "Mounted '$1' at $(server_mountpoint "$1")"
+}
+
+cmd_server_unmount() {
+  require_server "$@"
+  systemctl --user stop "$(mount_unit "$1")"
+  echo "Unmounted '$1'."
+}
+
+cmd_server_open() {
+  require_server "$@"
+  import_ssh_agent
+  systemctl --user start "$(mount_unit "$1")" || die "Could not mount '$1'."
+  xdg-open "$(server_mountpoint "$1")" >/dev/null 2>&1 &
+}
+
+cmd_server_remove() {
+  require_server "$@"
+  local alias="$1" mountpoint tmp line
+  mountpoint="$(server_mountpoint "$alias")"
+  systemctl --user disable --now "$(mount_unit "$alias")" 2>/dev/null || true
+  cmd_internal_unmount "$alias"
+  tmp="$(mktemp)"
+  while IFS= read -r line; do
+    [[ "$line" == "$alias" ]] || printf '%s\n' "$line"
+  done < "$SERVERS_CONF" > "$tmp"
+  mv "$tmp" "$SERVERS_CONF"
+  bookmark_remove "$mountpoint"
+  rmdir "$mountpoint" 2>/dev/null || true
+  echo "Removed '$alias'. Remote files were not changed."
+}
+
+cmd_server() {
+  local action="${1:-help}"
+  shift 2>/dev/null || true
+  case "$action" in
+    add) cmd_server_add "$@" ;;
+    list|ls) cmd_server_list "$@" ;;
+    mount) cmd_server_mount "$@" ;;
+    unmount) cmd_server_unmount "$@" ;;
+    open) cmd_server_open "$@" ;;
+    remove|rm) cmd_server_remove "$@" ;;
+    *) echo "usage: cloudfs server {add|list|mount|unmount|open|remove} [ssh_alias]"; return 1 ;;
+  esac
+}
+
+cmd_internal_mount() {
+  [[ $# -eq 1 ]] || die "internal mount target missing"
+  local target="$1" mountpoint
+  if [[ "$target" == "gdrive" ]]; then
+    mountpoint="$DRIVE_MOUNT"
+    [[ "$mountpoint" == /* ]] || die "CLOUDFS_DRIVE_MOUNT must be an absolute path."
+    [[ ! -L "$mountpoint" ]] || die "Refusing to mount Google Drive over symlink: $mountpoint"
+    if [[ -d "$mountpoint" && -n "$(ls -A "$mountpoint" 2>/dev/null)" ]]; then
+      die "Refusing to mount Google Drive over non-empty directory: $mountpoint"
+    fi
+    mkdir -p "$mountpoint"
+    exec rclone mount "${REMOTE}:" "$mountpoint" \
+      --vfs-cache-mode writes \
+      --vfs-cache-max-size 2G \
+      --dir-cache-time 1m \
+      --poll-interval 30s \
+      --cache-dir "$HOME/.cache/cloudfs/gdrive"
+  fi
+
+  validate_server_alias "$target"
+  server_registered "$target" || die "Server '$target' is not registered."
+  mountpoint="$(server_mountpoint "$target")"
+  [[ ! -L "$mountpoint" ]] || die "Refusing to mount over symlink: $mountpoint"
+  if [[ -d "$mountpoint" && -n "$(ls -A "$mountpoint" 2>/dev/null)" ]]; then
+    die "Refusing to mount over non-empty directory: $mountpoint"
+  fi
+  mkdir -p "$mountpoint"
+  exec rclone mount :sftp: "$mountpoint" \
+    --sftp-ssh "ssh -o BatchMode=yes $target" \
+    --sftp-disable-hashcheck \
+    --vfs-cache-mode writes \
+    --vfs-cache-max-size 2G \
+    --dir-cache-time 1m \
+    --cache-dir "$HOME/.cache/cloudfs/servers/$target"
+}
+
+cmd_validate() {
+  [[ "$DRIVE_MOUNT" == /* ]] || die "CLOUDFS_DRIVE_MOUNT must be an absolute path."
+  load_conf
+  local alias mountpoint
+  [[ -f "$SERVERS_CONF" ]] || return 0
+  while IFS= read -r alias; do
+    [[ -n "$alias" && "$alias" != \#* ]] || continue
+    validate_server_alias "$alias"
+    mountpoint="$(server_mountpoint "$alias")"
+    if [[ "$mountpoint" == "$DRIVE_MOUNT" || "$mountpoint" == "$DRIVE_MOUNT"/* \
+      || "$DRIVE_MOUNT" == "$mountpoint"/* ]]; then
+      die "Server mount $mountpoint overlaps the Google Drive mount $DRIVE_MOUNT."
+    fi
+    reject_sync_overlap "$mountpoint"
+  done < "$SERVERS_CONF"
+}
+
+cmd_internal_unmount() {
+  [[ $# -eq 1 ]] || return 0
+  local target="$1" mountpoint
+  if [[ "$target" == "gdrive" ]]; then
+    mountpoint="$DRIVE_MOUNT"
+  else
+    validate_server_alias "$target"
+    mountpoint="$(server_mountpoint "$target")"
+  fi
+  fusermount -u "$mountpoint" 2>/dev/null || fusermount3 -u "$mountpoint" 2>/dev/null \
+    || fusermount -uz "$mountpoint" 2>/dev/null || fusermount3 -uz "$mountpoint" 2>/dev/null || true
+}
+
+cmd_drive_open() {
+  systemctl --user start "$(mount_unit gdrive)" || die "Could not mount Google Drive."
+  xdg-open "$DRIVE_MOUNT" >/dev/null 2>&1 &
+}
+
+cmd_status() {
+  local svc="stopped"
+  systemctl --user is-active -q cloudfs 2>/dev/null && svc="running"
+  local mnt
+  mnt="$(mount_state "$(mount_unit gdrive)")"
+  [[ "$mnt" != "mounted" ]] || mnt="mounted at $DRIVE_MOUNT"
+  local st="-" ts="-"
+  if [[ -f "$STATUS_FILE" ]]; then
+    IFS='|' read -r st ts < "$STATUS_FILE"
+    ts="$(date -d "@$ts" '+%H:%M:%S' 2>/dev/null || echo '-')"
+  fi
+  echo "service: $svc   last state: $st ($ts)   drive: $mnt"
+  echo
+  cmd_list
+  echo
+  echo "servers:"
+  cmd_server_list
+}
+
+cmd_log() { journalctl --user -u cloudfs -f; }
+
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-help}" in
+  daemon)     cmd_daemon ;;
+  add)        shift; cmd_add "$@" ;;
+  remove|rm)  shift; cmd_remove "$@" ;;
+  list|ls)    cmd_list ;;
+  sync)       cmd_sync ;;
+  mount)      systemctl --user start "$(mount_unit gdrive)" && echo "Drive mounted at $DRIVE_MOUNT" ;;
+  unmount)    systemctl --user stop "$(mount_unit gdrive)" && echo "Unmounted." ;;
+  open)       cmd_drive_open ;;
+  server)     shift; cmd_server "$@" ;;
+  pause)      systemctl --user stop cloudfs && echo "Paused." ;;
+  resume)     systemctl --user start cloudfs && echo "Resumed." ;;
+  status)     cmd_status ;;
+  log|logs)   cmd_log ;;
+  _mount)     shift; cmd_internal_mount "$@" ;;
+  _unmount)   shift; cmd_internal_unmount "$@" ;;
+  _validate)  cmd_validate ;;
+  help|-h|--help|*) usage ;;
+esac
